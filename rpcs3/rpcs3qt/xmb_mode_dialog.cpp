@@ -2,6 +2,7 @@
 #include "xmb_mode_dialog.h"
 #include "xmb_firmware.h"
 #include "xmb_p3t.h"
+#include "xmb_p3t_animation.h"
 #include "xmb_wave_model.h"
 #include "xmb_wave_widget.h"
 #include "category.h"
@@ -19,11 +20,33 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QImageReader>
+#include <QRandomGenerator>
 #include "Emu/vfs_config.h"
 #include "Emu/system_utils.hpp"
 
 namespace
 {
+	void draw_cover(QPainter& painter, const QRectF& target, const QImage& image)
+	{
+		if (image.isNull() || target.width() <= 0 || target.height() <= 0) return;
+		QRectF source(image.rect());
+		const qreal source_aspect = source.width() / source.height();
+		const qreal target_aspect = target.width() / target.height();
+		if (source_aspect > target_aspect)
+		{
+			const qreal width = source.height() * target_aspect;
+			source.setLeft((source.width() - width) / 2);
+			source.setWidth(width);
+		}
+		else
+		{
+			const qreal height = source.width() / target_aspect;
+			source.setTop((source.height() - height) / 2);
+			source.setHeight(height);
+		}
+		painter.drawImage(target, image, source);
+	}
+
 	struct xmb_gradient { qreal angle; QColor start; QColor end; };
 	const std::array<xmb_gradient, 12> original_gradients{{
 		{90.25, QColor(0xC5,0xC5,0xC5), QColor(0xC9,0xC9,0xC9)}, {67, QColor(0xCB,0x9E,0x0D), QColor(0xDB,0xD6,0x29)},
@@ -127,7 +150,16 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	if (!m_p3t_theme_path.isEmpty())
 	{
 		const auto theme = xmb_p3t::read(m_p3t_theme_path);
-		if (!theme.background.isNull()) { m_p3t_background = theme.background; m_p3t_theme_name = theme.name; m_p3t_icons = theme.icons; }
+		if (!theme.background.isNull())
+		{
+			m_p3t_background = theme.background; m_p3t_theme_name = theme.name; m_p3t_icons = theme.icons;
+			if (theme.dynamic && theme.animation_size)
+			{
+				const auto animation = xmb_p3t_animation::read(m_p3t_theme_path, theme.animation_offset, theme.animation_size);
+				m_p3t_slides = animation.frames; m_p3t_slide_interval = animation.interval; m_p3t_slide_fade = animation.fade;
+				if (!m_p3t_slides.isEmpty()) { m_p3t_slide_start = QRandomGenerator::global()->bounded(m_p3t_slides.size()); m_p3t_background = m_p3t_slides[m_p3t_slide_start]; m_p3t_slide_clock.start(); }
+			}
+		}
 		else { m_p3t_theme_path.clear(); preferences.remove(QStringLiteral("p3tTheme")); }
 	}
 	m_background_mode = std::clamp(preferences.value(QStringLiteral("backgroundMode"), 0).toInt(), 0, 2);
@@ -135,6 +167,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	if (preferences.value(QStringLiteral("themeMonth"), -1).toInt() < 0) m_theme_month = -1;
 	m_accent_color = preferences.value(QStringLiteral("accent"), QColor(255, 255, 255)).value<QColor>();
 	m_show_clock = preferences.value(QStringLiteral("showClock"), true).toBool();
+	m_show_game_version = preferences.value(QStringLiteral("showGameVersion"), false).toBool();
 	m_column = std::clamp(preferences.value(QStringLiteral("column"), 5).toInt(), 0, static_cast<int>(m_categories.size()) - 1);
 	for (int i = 0; i < m_focus.size(); ++i) m_focus[i] = std::max(0, preferences.value(QStringLiteral("focus/%1").arg(i), m_focus[i]).toInt());
 	m_visual_column = static_cast<float>(m_column);
@@ -204,7 +237,9 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		leaf("armsx3.background", tr("XMB Background"), QString::fromUtf8("\u25a7"), "xmb.background"),
 		leaf("armsx3.accent", tr("XMB Accent Color"), QString::fromUtf8("\u25ce"), "xmb.accent"),
 		leaf("armsx3.clock", tr("XMB Clock"), QString::fromUtf8("\u25f7"), "xmb.clock"),
-		leaf("armsx3.remoteplay", tr("Remote Play Setup"), QString::fromUtf8("\u25ce"), "remoteplay")
+		leaf("armsx3.remoteplay", tr("Remote Play Setup"), QString::fromUtf8("\u25ce"), "remoteplay"),
+		leaf("armsx3.gameVersion", tr("Show Game Version"), QString::fromUtf8("\u25ce"), "xmb.gameVersion",
+			m_show_game_version ? tr("On") : tr("Off"))
 	}));
 	m_items[2] = { folder("photo.screenshots", tr("Screenshots"), QString::fromUtf8("▧"), {leaf("photo.open", tr("Open Screenshot Manager"), QString::fromUtf8("▧"), "screenshots")}),
 		leaf("photo.empty", tr("There are no images."), QString::fromUtf8("▧"), "") };
@@ -266,7 +301,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	for (int i = 0; i < m_games.size(); ++i)
 	{
 		item game; game.key = QString::fromStdString(m_games[i]->serial); game.title = QString::fromStdString(m_games[i]->name.empty() ? m_games[i]->serial : m_games[i]->name);
-		game.subtitle = QString::fromStdString(m_games[i]->serial); game.icon = QStringLiteral("🎮"); game.game = i;
+		game.subtitle = m_show_game_version ? QString::fromStdString(m_games[i]->GetGameVersion()) : QString::fromStdString(m_games[i]->serial); game.icon = QStringLiteral("🎮"); game.game = i;
 		m_items[5].push_back(std::move(game));
 	}
 	if (m_in_game)
@@ -434,6 +469,7 @@ void xmb_mode_dialog::set_custom_background(const QString& path)
 {
 	m_custom_background = path;
 	m_p3t_background = {};
+	m_p3t_slides.clear();
 	m_p3t_theme_path.clear();
 	m_p3t_theme_name.clear();
 	m_p3t_icons.clear();
@@ -451,6 +487,13 @@ QString xmb_mode_dialog::import_p3t_theme(const QString& path)
 	m_p3t_theme_path = path;
 	m_p3t_theme_name = theme.name;
 	m_p3t_background = theme.background;
+	m_p3t_slides.clear(); m_p3t_slide_clock.invalidate();
+	if (theme.dynamic && theme.animation_size)
+	{
+		const auto animation = xmb_p3t_animation::read(path, theme.animation_offset, theme.animation_size);
+		m_p3t_slides = animation.frames; m_p3t_slide_interval = animation.interval; m_p3t_slide_fade = animation.fade;
+		if (!m_p3t_slides.isEmpty()) { m_p3t_background = m_p3t_slides.front(); m_p3t_slide_start = QRandomGenerator::global()->bounded(m_p3t_slides.size()); m_p3t_slide_clock.start(); }
+	}
 	m_p3t_icons = theme.icons;
 	apply_p3t_icons();
 	m_custom_background.clear();
@@ -467,6 +510,7 @@ void xmb_mode_dialog::reset_custom_background()
 {
 	m_custom_background.clear();
 	m_p3t_background = {};
+	m_p3t_slides.clear(); m_p3t_slide_clock.invalidate();
 	m_p3t_theme_path.clear();
 	m_p3t_theme_name.clear();
 	m_p3t_icons.clear();
@@ -506,6 +550,29 @@ void xmb_mode_dialog::toggle_clock()
 	m_show_clock = !m_show_clock;
 	QSettings().setValue(QStringLiteral("armsxpc/xmb/showClock"), m_show_clock);
 	update();
+}
+
+void xmb_mode_dialog::toggle_game_version()
+{
+	m_show_game_version = !m_show_game_version;
+	QSettings().setValue(QStringLiteral("armsxpc/xmb/showGameVersion"), m_show_game_version);
+	update_game_version_labels();
+	update();
+}
+
+void xmb_mode_dialog::update_game_version_labels()
+{
+	if (!m_in_game && m_items.size() > 5)
+	{
+		for (item& node : m_items[5])
+			if (node.game >= 0 && node.game < m_games.size())
+				node.subtitle = m_show_game_version ? QString::fromStdString(m_games[node.game]->GetGameVersion()) : QString::fromStdString(m_games[node.game]->serial);
+	}
+	if (m_items.size() > 1)
+		for (item& group : m_items[1])
+			if (group.key == QStringLiteral("settings.armsx3"))
+				for (item& setting : group.children)
+					if (setting.key == QStringLiteral("armsx3.gameVersion")) setting.subtitle = m_show_game_version ? tr("On") : tr("Off");
 }
 
 const std::vector<xmb_mode_dialog::item>& xmb_mode_dialog::current_items() const
@@ -613,27 +680,34 @@ void xmb_mode_dialog::paintEvent(QPaintEvent*)
 	if (m_wave_widget && m_wave_widget->geometry() != rect()) m_wave_widget->setGeometry(rect());
 	QPainter p(this);
 	p.setRenderHint(QPainter::Antialiasing);
+	p.setRenderHint(QPainter::SmoothPixmapTransform);
 	const qreal scale = std::min(width() / 1280.0, height() / 720.0);
 	p.scale(scale, scale);
 	const qreal w = width() / scale, h = height() / scale;
-	if (m_in_game)
+	const qreal elapsed = m_p3t_slide_clock.isValid() ? m_p3t_slide_clock.elapsed() / 1000.0 : 0.0;
+	const qreal cycle = std::max(0.25, m_p3t_slide_interval);
+	const int step = static_cast<int>(elapsed / cycle);
+	const int current = m_p3t_slides.isEmpty() ? 0 : (m_p3t_slide_start + step) % m_p3t_slides.size();
+	if (!m_p3t_slides.isEmpty()) draw_cover(p, QRectF(0, 0, w, h), m_p3t_slides[current]);
+	else if (!m_p3t_background.isNull()) draw_cover(p, QRectF(0, 0, w, h), m_p3t_background);
+	else if (!m_in_game && m_background_mode == 2 && !m_custom_background.isEmpty())
 	{
-		p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 165));
-	}
-	else
-	{
-		if (!m_p3t_background.isNull())
-		{
-			p.drawImage(QRectF(0, 0, w, h), m_p3t_background);
-		}
-		else if (m_background_mode == 2 && !m_custom_background.isEmpty())
-		{
-			QPixmap backdrop(m_custom_background);
-			if (!backdrop.isNull()) p.drawPixmap(QRectF(0, 0, w, h), backdrop, backdrop.rect());
-			else fill_original_background(p, w, h, m_theme_month);
-		}
+		QPixmap backdrop(m_custom_background);
+		if (!backdrop.isNull()) draw_cover(p, QRectF(0, 0, w, h), backdrop.toImage());
 		else fill_original_background(p, w, h, m_theme_month);
 	}
+	else fill_original_background(p, w, h, m_theme_month);
+	if (m_p3t_slides.size() > 1 && m_p3t_slide_clock.isValid())
+	{
+		const int next = (current + 1) % m_p3t_slides.size();
+		const qreal phase = std::fmod(elapsed, cycle);
+		if (m_p3t_slide_fade > 0 && phase >= cycle - m_p3t_slide_fade)
+		{
+			p.save(); p.setOpacity(std::clamp((phase - (cycle - m_p3t_slide_fade)) / m_p3t_slide_fade, 0.0, 1.0));
+			draw_cover(p, QRectF(0, 0, w, h), m_p3t_slides[next]); p.restore();
+		}
+	}
+	if (m_in_game) p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 165));
 	QFont font(m_firmware->font_family().isEmpty() ? QStringLiteral("Segoe UI Light") : m_firmware->font_family());
 	const qreal focus_x = std::min(376.0, w * .3);
 	const qreal cat_y = 193.0;

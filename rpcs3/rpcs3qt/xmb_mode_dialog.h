@@ -32,6 +32,7 @@ public:
 	void set_theme_month(int month);
 	void set_accent_color(const QColor& color);
 	void toggle_clock();
+	void toggle_game_version();
 
 Q_SIGNALS:
 	void bootRequested(const game_info& game);
@@ -69,11 +70,17 @@ private:
 	QString m_p3t_theme_path;
 	QString m_p3t_theme_name;
 	QImage m_p3t_background;
+	QVector<QImage> m_p3t_slides;
+	qreal m_p3t_slide_interval = 10.0;
+	qreal m_p3t_slide_fade = 1.5;
+	QElapsedTimer m_p3t_slide_clock;
+	int m_p3t_slide_start = 0;
 	QHash<QString, QImage> m_p3t_icons;
 	int m_background_mode = 0; // 0 Original firmware wave, 1 the Android 2D gradient, 2 imported image
 	int m_theme_month = -1; // -1 follows the calendar, 0..11 pins a month
 	QColor m_accent_color = QColor(255, 255, 255);
 	bool m_show_clock = true;
+	bool m_show_game_version = false;
 	int m_column = 5;
 	QVector<int> m_focus;
 	QVector<int> m_path;
@@ -99,5 +106,6 @@ private:
 	int& current_focus();
 	void rebuild_items();
 	void apply_p3t_icons();
+	void update_game_version_labels();
 	void launch_selected();
 };

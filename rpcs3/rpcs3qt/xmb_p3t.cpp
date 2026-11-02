@@ -141,7 +141,16 @@ xmb_p3t::result xmb_p3t::read(const QString& path)
 					continue;
 				}
 				if (type != type_file) continue;
-				if (attr == QStringLiteral("anim")) { out.dynamic = true; continue; }
+				if (attr == QStringLiteral("anim"))
+				{
+					out.dynamic = true;
+					if (size >= 8 && range_ok(offset, size, files_ref.size))
+					{
+						out.animation_offset = files_ref.offset + offset;
+						out.animation_size = size;
+					}
+					continue;
+				}
 				if (attr != QStringLiteral("hd") && attr != QStringLiteral("sd")) continue;
 				if (size < 4 || size > max_picture || !range_ok(offset, size, files_ref.size)) continue;
 				if (!file.seek(static_cast<qint64>(files_ref.offset + offset))) continue;

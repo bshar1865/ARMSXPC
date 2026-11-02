@@ -139,6 +139,7 @@ add_library(rpcs3_ui STATIC
     welcome_dialog.cpp
     xmb_mode_dialog.cpp
     xmb_p3t.cpp
+    xmb_p3t_animation.cpp
     xmb_firmware.cpp
     xmb_wave_model.cpp
     xmb_wave_widget.cpp
