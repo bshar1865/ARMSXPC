@@ -962,6 +962,8 @@ void main_window::ShowXmbMode()
 		}
 		else if (action == "xmb.clock") dialog.toggle_clock();
 		else if (action == "xmb.gameVersion") dialog.toggle_game_version();
+		else if (action == "xmb.gameRegion") dialog.toggle_game_region();
+		else if (action == "xmb.gameBackgrounds") dialog.toggle_game_backgrounds();
 		else if (action == "website") QDesktopServices::openUrl(QUrl("https://armsx3.com"));
 		else if (action == "github") QDesktopServices::openUrl(QUrl("https://github.com/ARMSX2/ARMSX3"));
 		else if (action == "about") { QMessageBox::about(this, tr("About ARMSX3"), tr("ARMSX3 XMB frontend running on RPCS3 desktop.")); }

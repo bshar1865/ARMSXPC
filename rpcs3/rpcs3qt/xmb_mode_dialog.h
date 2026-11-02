@@ -17,6 +17,7 @@ class xmb_wave_model;
 class xmb_wave_widget;
 
 class QTimer;
+template <typename T> class QFutureWatcher;
 
 // Desktop rendition of the ARMSX3 phone XMB, laid out in the same 1280x720 console space.
 class xmb_mode_dialog final : public QDialog
@@ -33,6 +34,8 @@ public:
 	void set_accent_color(const QColor& color);
 	void toggle_clock();
 	void toggle_game_version();
+	void toggle_game_region();
+	void toggle_game_backgrounds();
 
 Q_SIGNALS:
 	void bootRequested(const game_info& game);
@@ -70,6 +73,7 @@ private:
 	QString m_p3t_theme_path;
 	QString m_p3t_theme_name;
 	QImage m_p3t_background;
+	QImage m_game_background;
 	QVector<QImage> m_p3t_slides;
 	qreal m_p3t_slide_interval = 10.0;
 	qreal m_p3t_slide_fade = 1.5;
@@ -81,6 +85,8 @@ private:
 	QColor m_accent_color = QColor(255, 255, 255);
 	bool m_show_clock = true;
 	bool m_show_game_version = false;
+	bool m_show_game_region = false;
+	bool m_show_game_backgrounds = true;
 	int m_column = 5;
 	QVector<int> m_focus;
 	QVector<int> m_path;
@@ -102,10 +108,19 @@ private:
 	int m_option_focus = 0;
 	int m_option_game = -1;
 	QTimer* m_animation = nullptr;
+	QTimer* m_game_backdrop_delay = nullptr;
+	QFutureWatcher<QImage>* m_game_backdrop_watcher = nullptr;
+	QString m_game_backdrop_key;
+	QString m_game_backdrop_loading_key;
+	game_info m_game_backdrop_pending;
+	QElapsedTimer m_game_backdrop_fade;
 	const std::vector<item>& current_items() const;
 	int& current_focus();
 	void rebuild_items();
 	void apply_p3t_icons();
 	void update_game_version_labels();
+	QString game_subtitle(int index) const;
+	void refresh_game_backdrop();
+	void load_game_backdrop();
 	void launch_selected();
 };

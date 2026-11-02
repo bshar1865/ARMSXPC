@@ -21,6 +21,9 @@
 #include <QFileInfo>
 #include <QImageReader>
 #include <QRandomGenerator>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
+#include "Loader/ISO.h"
 #include "Emu/vfs_config.h"
 #include "Emu/system_utils.hpp"
 
@@ -168,6 +171,8 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	m_accent_color = preferences.value(QStringLiteral("accent"), QColor(255, 255, 255)).value<QColor>();
 	m_show_clock = preferences.value(QStringLiteral("showClock"), true).toBool();
 	m_show_game_version = preferences.value(QStringLiteral("showGameVersion"), false).toBool();
+	m_show_game_region = preferences.value(QStringLiteral("showGameRegion"), false).toBool();
+	m_show_game_backgrounds = preferences.value(QStringLiteral("showGameBackgrounds"), true).toBool();
 	m_column = std::clamp(preferences.value(QStringLiteral("column"), 5).toInt(), 0, static_cast<int>(m_categories.size()) - 1);
 	for (int i = 0; i < m_focus.size(); ++i) m_focus[i] = std::max(0, preferences.value(QStringLiteral("focus/%1").arg(i), m_focus[i]).toInt());
 	m_visual_column = static_cast<float>(m_column);
@@ -230,6 +235,8 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 				leaf("settings.theme.color", tr("XMB Color"), QString::fromUtf8("\u25ce"), "xmb.color"),
 				leaf("settings.theme.reset", tr("Restore ARMSX3 Background"), QString::fromUtf8("\u21ba"), "xmb.background.reset"),
 				leaf("settings.theme.accent", tr("XMB Accent Color"), QString::fromUtf8("\u25ce"), "xmb.accent"),
+			leaf("settings.theme.gameBackgrounds", tr("Show Game Backgrounds (PIC1)"), QString::fromUtf8("\u25a7"), "xmb.gameBackgrounds",
+				m_show_game_backgrounds ? tr("On") : tr("Off")),
 				leaf("settings.theme.clock", tr("Show / Hide Clock"), QString::fromUtf8("\u25f7"), "xmb.clock"),
 				leaf("settings.theme.gui", tr("RPCS3 Interface Settings"), QString::fromUtf8("\u2699"), "settings.8")
 			};
@@ -238,7 +245,9 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		leaf("armsx3.accent", tr("XMB Accent Color"), QString::fromUtf8("\u25ce"), "xmb.accent"),
 		leaf("armsx3.clock", tr("XMB Clock"), QString::fromUtf8("\u25f7"), "xmb.clock"),
 		leaf("armsx3.remoteplay", tr("Remote Play Setup"), QString::fromUtf8("\u25ce"), "remoteplay"),
-		leaf("armsx3.gameVersion", tr("Show Game Version"), QString::fromUtf8("\u25ce"), "xmb.gameVersion",
+		leaf("armsx3.gameRegion", tr("Show Game Region Number"), QString::fromUtf8("\u25ce"), "xmb.gameRegion",
+			m_show_game_region ? tr("On") : tr("Off")),
+		leaf("armsx3.gameVersion", tr("Show Game Update Version"), QString::fromUtf8("\u25ce"), "xmb.gameVersion",
 			m_show_game_version ? tr("On") : tr("Off"))
 	}));
 	m_items[2] = { folder("photo.screenshots", tr("Screenshots"), QString::fromUtf8("▧"), {leaf("photo.open", tr("Open Screenshot Manager"), QString::fromUtf8("▧"), "screenshots")}),
@@ -301,7 +310,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	for (int i = 0; i < m_games.size(); ++i)
 	{
 		item game; game.key = QString::fromStdString(m_games[i]->serial); game.title = QString::fromStdString(m_games[i]->name.empty() ? m_games[i]->serial : m_games[i]->name);
-		game.subtitle = m_show_game_version ? QString::fromStdString(m_games[i]->GetGameVersion()) : QString::fromStdString(m_games[i]->serial); game.icon = QStringLiteral("🎮"); game.game = i;
+		game.subtitle = game_subtitle(i); game.icon = QStringLiteral("🎮"); game.game = i;
 		m_items[5].push_back(std::move(game));
 	}
 	if (m_in_game)
@@ -381,6 +390,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	connect(m_animation, &QTimer::timeout, this, qOverload<>(&xmb_mode_dialog::update));
 	connect(m_animation, &QTimer::timeout, this, [this]
 	{
+		refresh_game_backdrop();
 		static const QEasingCurve fast_out_slow_in = []
 		{
 			QEasingCurve curve(QEasingCurve::BezierSpline);
@@ -416,6 +426,23 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		}
 		const qreal level_progress = std::clamp(m_level_clock.isValid() ? m_level_clock.elapsed() / 240.0 : 1.0, 0.0, 1.0);
 		m_visual_level = m_level_from + (level_target - m_level_from) * fast_out_slow_in.valueForProgress(level_progress);
+	});
+	m_game_backdrop_delay = new QTimer(this);
+	m_game_backdrop_delay->setSingleShot(true);
+	m_game_backdrop_delay->setInterval(650);
+	connect(m_game_backdrop_delay, &QTimer::timeout, this, &xmb_mode_dialog::load_game_backdrop);
+	m_game_backdrop_watcher = new QFutureWatcher<QImage>(this);
+	connect(m_game_backdrop_watcher, &QFutureWatcher<QImage>::finished, this, [this]
+	{
+		const QString loaded_key = m_game_backdrop_loading_key;
+		m_game_backdrop_loading_key.clear();
+		if (loaded_key == m_game_backdrop_key)
+		{
+			m_game_background = m_game_backdrop_watcher->result();
+			if (!m_game_background.isNull()) m_game_backdrop_fade.start();
+		}
+		if (loaded_key != m_game_backdrop_key && !m_game_backdrop_key.isEmpty()) m_game_backdrop_delay->start(0);
+		update();
 	});
 	m_visual_focus = static_cast<float>(current_focus());
 	m_target_column = m_column;
@@ -560,19 +587,113 @@ void xmb_mode_dialog::toggle_game_version()
 	update();
 }
 
+void xmb_mode_dialog::toggle_game_region()
+{
+	m_show_game_region = !m_show_game_region;
+	QSettings().setValue(QStringLiteral("armsxpc/xmb/showGameRegion"), m_show_game_region);
+	update_game_version_labels();
+	update();
+}
+
+void xmb_mode_dialog::toggle_game_backgrounds()
+{
+	m_show_game_backgrounds = !m_show_game_backgrounds;
+	QSettings().setValue(QStringLiteral("armsxpc/xmb/showGameBackgrounds"), m_show_game_backgrounds);
+	refresh_game_backdrop();
+	update();
+}
+
+QString xmb_mode_dialog::game_subtitle(int index) const
+{
+	if (index < 0 || index >= m_games.size()) return {};
+	QStringList details;
+	if (m_show_game_region) details.push_back(QString::fromStdString(m_games[index]->serial));
+	if (m_show_game_version)
+	{
+		const QString version = QString::fromStdString(m_games[index]->GetGameVersion());
+		if (!version.isEmpty()) details.push_back(tr("Version %1").arg(version));
+	}
+	return details.join(QStringLiteral(" · "));
+}
+
 void xmb_mode_dialog::update_game_version_labels()
 {
 	if (!m_in_game && m_items.size() > 5)
 	{
 		for (item& node : m_items[5])
 			if (node.game >= 0 && node.game < m_games.size())
-				node.subtitle = m_show_game_version ? QString::fromStdString(m_games[node.game]->GetGameVersion()) : QString::fromStdString(m_games[node.game]->serial);
+				node.subtitle = game_subtitle(node.game);
 	}
 	if (m_items.size() > 1)
 		for (item& group : m_items[1])
 			if (group.key == QStringLiteral("settings.armsx3"))
 				for (item& setting : group.children)
-					if (setting.key == QStringLiteral("armsx3.gameVersion")) setting.subtitle = m_show_game_version ? tr("On") : tr("Off");
+				{
+					if (setting.key == QStringLiteral("armsx3.gameRegion")) setting.subtitle = m_show_game_region ? tr("On") : tr("Off");
+					else if (setting.key == QStringLiteral("armsx3.gameVersion")) setting.subtitle = m_show_game_version ? tr("On") : tr("Off");
+				}
+	std::function<void(item&)> update_background_setting = [&](item& node)
+	{
+		if (node.key == QStringLiteral("settings.theme.gameBackgrounds")) node.subtitle = m_show_game_backgrounds ? tr("On") : tr("Off");
+		for (item& child : node.children) update_background_setting(child);
+	};
+	for (item& node : m_items[1]) update_background_setting(node);
+}
+
+void xmb_mode_dialog::refresh_game_backdrop()
+{
+	game_info target;
+	if (m_show_game_backgrounds)
+	{
+		if (m_in_game) target = m_running_game;
+		else if (m_column == 5 && m_levels.empty())
+		{
+			const int focus = m_focus[m_column];
+			if (focus >= 0 && focus < static_cast<int>(m_items[m_column].size()))
+			{
+				const int index = m_items[m_column][focus].game;
+				if (index >= 0 && index < m_games.size()) target = m_games[index];
+			}
+		}
+	}
+	const QString key = target ? QString::fromStdString(target->serial + "|" + target->path) : QString();
+	if (key == m_game_backdrop_key) return;
+	m_game_backdrop_key = key;
+	m_game_backdrop_pending = target;
+	m_game_background = {};
+	m_game_backdrop_fade.invalidate();
+	if (m_game_backdrop_delay)
+	{
+		m_game_backdrop_delay->stop();
+		if (!key.isEmpty()) m_game_backdrop_delay->start(650);
+	}
+	update();
+}
+
+void xmb_mode_dialog::load_game_backdrop()
+{
+	if (!m_game_backdrop_pending || m_game_backdrop_key.isEmpty()) return;
+	if (m_game_backdrop_watcher->isRunning()) return;
+	const game_info game = m_game_backdrop_pending;
+	const QString key = m_game_backdrop_key;
+	m_game_backdrop_loading_key = key;
+	m_game_backdrop_watcher->setFuture(QtConcurrent::run([game]()
+	{
+		const auto [path, in_archive] = rpcs3::utils::get_game_content_path(game_content_type::background_picture, *game);
+		if (path.empty()) return QImage{};
+		if (!in_archive) return QImageReader(QString::fromStdString(path)).read();
+		iso_archive archive(game->path);
+		if (!archive.is_valid()) return QImage{};
+		auto stream = archive.open(path);
+		if (!stream) return QImage{};
+		const u64 size = stream->size();
+		if (!size || size > (64ull << 20)) return QImage{};
+		QByteArray data(static_cast<qsizetype>(size), Qt::Uninitialized);
+		if (stream->read(data.data(), size) != size) return QImage{};
+		QImage image;
+		image.loadFromData(data, "PNG");
+		return image;
+	}));
 }
 
 const std::vector<xmb_mode_dialog::item>& xmb_mode_dialog::current_items() const
@@ -688,7 +809,14 @@ void xmb_mode_dialog::paintEvent(QPaintEvent*)
 	const qreal cycle = std::max(0.25, m_p3t_slide_interval);
 	const int step = static_cast<int>(elapsed / cycle);
 	const int current = m_p3t_slides.isEmpty() ? 0 : (m_p3t_slide_start + step) % m_p3t_slides.size();
-	if (!m_p3t_slides.isEmpty()) draw_cover(p, QRectF(0, 0, w, h), m_p3t_slides[current]);
+	if (!m_game_background.isNull())
+	{
+		p.save();
+		if (m_game_backdrop_fade.isValid()) p.setOpacity(std::clamp(m_game_backdrop_fade.elapsed() / 700.0, 0.0, 1.0));
+		draw_cover(p, QRectF(0, 0, w, h), m_game_background);
+		p.restore();
+	}
+	else if (!m_p3t_slides.isEmpty()) draw_cover(p, QRectF(0, 0, w, h), m_p3t_slides[current]);
 	else if (!m_p3t_background.isNull()) draw_cover(p, QRectF(0, 0, w, h), m_p3t_background);
 	else if (!m_in_game && m_background_mode == 2 && !m_custom_background.isEmpty())
 	{
@@ -697,7 +825,7 @@ void xmb_mode_dialog::paintEvent(QPaintEvent*)
 		else fill_original_background(p, w, h, m_theme_month);
 	}
 	else fill_original_background(p, w, h, m_theme_month);
-	if (m_p3t_slides.size() > 1 && m_p3t_slide_clock.isValid())
+	if (m_game_background.isNull() && m_p3t_slides.size() > 1 && m_p3t_slide_clock.isValid())
 	{
 		const int next = (current + 1) % m_p3t_slides.size();
 		const qreal phase = std::fmod(elapsed, cycle);
