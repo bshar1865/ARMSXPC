@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "pad_thread.h"
+#include "remote_play_input.h"
 #include "Emu/android_app_state.h"
 #include "product_info.h"
 #include "ds3_pad_handler.h"
@@ -273,6 +274,11 @@ void pad_thread::SetRumble(u32 pad, u8 large_motor, u8 small_motor)
 	m_pads[pad]->m_last_rumble_time_us = now_us;
 	m_pads[pad]->m_vibrate_motors[0].value = large_motor;
 	m_pads[pad]->m_vibrate_motors[1].value = small_motor;
+	if (pad == 1 && remote_play_input::active.load(std::memory_order_acquire))
+	{
+		remote_play_input::rumble_large.store(large_motor, std::memory_order_relaxed);
+		remote_play_input::rumble_small.store(small_motor, std::memory_order_relaxed);
+	}
 
 	// Rumble copilots as well
 	for (const auto& copilot : m_pads[pad]->copilots)
@@ -307,6 +313,35 @@ void pad_thread::apply_copilots()
 	};
 
 	std::lock_guard lock(pad::g_pad_mutex);
+	const bool remote_active = remote_play_input::active.load(std::memory_order_acquire);
+	// A null player-two slot is made into a standard pad while Remote Play is connected. Existing
+	// configured/physical pads keep their own device setup and receive the remote input as an overlay.
+	if (m_pads.size() > 1 && m_pads[1] && m_pads[1]->m_pad_handler == pad_handler::null)
+	{
+		auto& remote_pad = *m_pads[1];
+		if (remote_active)
+		{
+			remote_pad.m_port_status |= CELL_PAD_STATUS_CONNECTED;
+			remote_pad.m_device_capability = CELL_PAD_CAPABILITY_PS3_CONFORMITY | CELL_PAD_CAPABILITY_PRESS_MODE | CELL_PAD_CAPABILITY_ACTUATOR;
+			remote_pad.m_device_type = CELL_PAD_DEV_TYPE_STANDARD;
+			remote_pad.m_class_type = CELL_PAD_PCLASS_TYPE_STANDARD;
+			if (remote_pad.m_buttons.empty())
+			{
+				for (const u32 key : {CELL_PAD_CTRL_UP, CELL_PAD_CTRL_RIGHT, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_SELECT, CELL_PAD_CTRL_START, CELL_PAD_CTRL_L3, CELL_PAD_CTRL_R3})
+					remote_pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{}, key);
+				for (const u32 key : {CELL_PAD_CTRL_TRIANGLE, CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_SQUARE, CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1, CELL_PAD_CTRL_L2, CELL_PAD_CTRL_R2})
+					remote_pad.m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{}, key);
+				remote_pad.m_sticks[0].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X;
+				remote_pad.m_sticks[1].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y;
+				remote_pad.m_sticks[2].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X;
+				remote_pad.m_sticks[3].m_offset = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y;
+			}
+		}
+		else if (!m_pads_connected[1])
+		{
+			remote_pad.m_port_status &= ~CELL_PAD_STATUS_CONNECTED;
+		}
+	}
 
 	for (auto& pad : m_pads)
 	{
@@ -335,6 +370,41 @@ void pad_thread::apply_copilots()
 
 			dst.m_offset = src.m_offset;
 			dst.m_value = src.m_value;
+		}
+
+		if (remote_active && pad->m_player_id == 1)
+		{
+			const u32 bits = remote_play_input::buttons.load(std::memory_order_relaxed);
+			const std::array<u32, 14> keys = {CELL_PAD_CTRL_UP, CELL_PAD_CTRL_RIGHT, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT,
+				CELL_PAD_CTRL_SELECT, CELL_PAD_CTRL_START, CELL_PAD_CTRL_L3, CELL_PAD_CTRL_R3, CELL_PAD_CTRL_TRIANGLE,
+				CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_SQUARE, CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1};
+			const std::array<u32, 14> offsets = {CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_BTN_OFFSET_DIGITAL1,
+				CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_BTN_OFFSET_DIGITAL1, CELL_PAD_BTN_OFFSET_DIGITAL1,
+				CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_BTN_OFFSET_DIGITAL2,
+				CELL_PAD_BTN_OFFSET_DIGITAL2, CELL_PAD_BTN_OFFSET_DIGITAL2};
+			for (usz key = 0; key < keys.size(); ++key)
+			{
+				auto it = std::find_if(pad->m_buttons_external.begin(), pad->m_buttons_external.end(), [&](const ButtonExternal& b) { return b.m_offset == offsets[key] && b.m_outKeyCode == keys[key]; });
+				if (it == pad->m_buttons_external.end()) { pad->m_buttons_external.push_back({offsets[key], keys[key], 0, false}); it = std::prev(pad->m_buttons_external.end()); }
+				it->m_pressed = (bits & (1u << key)) != 0;
+				it->m_value = it->m_pressed ? 255 : 0;
+			}
+			for (const auto& [key, value] : std::array<std::pair<u32, u8>, 2>{{{CELL_PAD_CTRL_L2, remote_play_input::l2.load(std::memory_order_relaxed)}, {CELL_PAD_CTRL_R2, remote_play_input::r2.load(std::memory_order_relaxed)}}})
+			{
+				auto it = std::find_if(pad->m_buttons_external.begin(), pad->m_buttons_external.end(), [&](const ButtonExternal& b) { return b.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL2 && b.m_outKeyCode == key; });
+				if (it == pad->m_buttons_external.end()) { pad->m_buttons_external.push_back({CELL_PAD_BTN_OFFSET_DIGITAL2, key, value, value != 0}); it = std::prev(pad->m_buttons_external.end()); }
+				it->m_value = value; it->m_pressed = value != 0;
+			}
+			for (auto& stick : pad->m_sticks_external)
+			{
+				switch (stick.m_offset)
+				{
+				case CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X: stick.m_value = remote_play_input::lx.load(std::memory_order_relaxed); break;
+				case CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y: stick.m_value = remote_play_input::ly.load(std::memory_order_relaxed); break;
+				case CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X: stick.m_value = remote_play_input::rx.load(std::memory_order_relaxed); break;
+				case CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y: stick.m_value = remote_play_input::ry.load(std::memory_order_relaxed); break;
+				}
+			}
 		}
 
 		if (pad->copilots.empty() || pad->is_copilot())

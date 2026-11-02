@@ -2,6 +2,11 @@
 # Select the version of libpng to use, default is builtin
 if (NOT USE_SYSTEM_LIBPNG)
 	# We use libpng's static library and don't need to build the shared library and run the tests
+	# The bundled libpng generator preprocesses its configuration without target include paths.
+	# Keep its zlib version check in sync with RPCS3's bundled zlib rather than MinGW's system copy.
+	if (NOT USE_SYSTEM_ZLIB)
+		set(ZLIB_INCLUDE_DIRS "${PROJECT_SOURCE_DIR}/3rdparty/zlib/zlib")
+	endif()
 	set(PNG_SHARED OFF CACHE BOOL "Build shared lib")
 	set(PNG_TESTS OFF CACHE BOOL "Build libpng tests")
 	set(SKIP_INSTALL_ALL ON)

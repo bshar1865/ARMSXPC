@@ -26,6 +26,10 @@ namespace utils
 				return false;
 
 			std::lock_guard lock(m_video_mtx);
+			// Live streams value the newest picture over a backlog of frames that are already late.
+			// File recording leaves this off and retains every frame.
+			if (drop_old_video_frames)
+				m_frames_to_encode.clear();
 			m_frames_to_encode.emplace_back(timestamp_ms, pitch, width, height, pixel_format, std::move(frame));
 			signal_work();
 			return true;
@@ -41,6 +45,18 @@ namespace utils
 
 			{
 				std::lock_guard lock(m_audio_mtx);
+				if (max_audio_queue_ms)
+				{
+					const usz max_samples = (static_cast<usz>(m_sample_rate) * max_audio_queue_ms) / 1000;
+					usz queued_samples = 0;
+					for (const auto& queued : m_samples_to_encode)
+						queued_samples += queued.sample_count;
+					while (!m_samples_to_encode.empty() && queued_samples + sample_count > max_samples)
+					{
+						queued_samples -= m_samples_to_encode.front().sample_count;
+						m_samples_to_encode.pop_front();
+					}
+				}
 				m_samples_to_encode.emplace_back(timestamp_us, sample_count, channels, std::move(sample));
 			}
 
@@ -114,6 +130,8 @@ namespace utils
 		// lands in the same 256-sample slot as the previous one, which a file recorder can absorb
 		// but a live stream hears as a click whenever cellAudio delivers two blocks close together.
 		bool accept_all_samples = false;
+		bool drop_old_video_frames = false;
+		u32 max_audio_queue_ms = 0;
 
 		// ARMSX3 remote play: counts audio blocks as they arrive, so the stream's audio thread can
 		// sleep until there is one instead of checking every millisecond.

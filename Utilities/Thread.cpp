@@ -4926,6 +4926,7 @@ u64 thread_ctrl::get_affinity_mask(thread_class group)
 		}
 		case native_core_arrangement::arm_big_little:
 		{
+			#if defined(ARCH_ARM64) && defined(__linux__)
 			// Put the threads that gate the frame -- SPU and RSX -- on the cores
 			// that can actually keep up, and leave the little cluster for PPU and
 			// helpers. Without this the OS spreads six SPU threads across a mix of
@@ -5008,6 +5009,11 @@ u64 thread_ctrl::get_affinity_mask(thread_class group)
 			default:
 				return slow_mask;
 			}
+			#else
+			// ARM capacity discovery is only available in the Linux sysfs backend.
+			// On other platforms, keep the process affinity mask unchanged.
+			return all_cores_mask;
+			#endif
 		}
 		case native_core_arrangement::amd_ccx:
 		{

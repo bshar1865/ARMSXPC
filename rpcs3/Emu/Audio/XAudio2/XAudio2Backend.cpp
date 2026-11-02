@@ -315,9 +315,13 @@ f64 XAudio2Backend::GetCallbackFrameLen()
 		return _10ms;
 	}
 
-	Microsoft::WRL::ComPtr<IXAudio2Extension> xaudio_ext{};
 	f64 min_latency{};
 
+#ifdef _MSC_VER
+	// IXAudio2Extension is an SDK extension exposed by the Microsoft Windows SDK,
+	// but is absent from MinGW's XAudio2 headers. Keep the conservative default on
+	// toolchains that cannot query the processing quantum.
+	Microsoft::WRL::ComPtr<IXAudio2Extension> xaudio_ext{};
 	if (HRESULT hr = m_xaudio2_instance.As(&xaudio_ext); FAILED(hr))
 	{
 		XAudio.error("QueryInterface() failed: %s (0x%08x)", std::system_category().message(hr), static_cast<u32>(hr));
@@ -332,6 +336,7 @@ f64 XAudio2Backend::GetCallbackFrameLen()
 			min_latency = static_cast<f64>(samples_per_q) / freq;
 		}
 	}
+#endif
 
 	return std::max<f64>(min_latency, _10ms); // 10ms is the minimum for XAudio
 }

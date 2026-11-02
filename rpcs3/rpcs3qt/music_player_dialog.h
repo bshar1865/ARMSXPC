@@ -15,6 +15,7 @@ class music_player_dialog : public QDialog
 
 public:
 	explicit music_player_dialog(QWidget* parent = nullptr);
+	explicit music_player_dialog(const QString& file_path, QWidget* parent = nullptr);
 	~music_player_dialog();
 
 private:

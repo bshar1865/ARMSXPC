@@ -108,6 +108,8 @@ private Q_SLOTS:
 	void BootGame();
 	void BootISO();
 	void BootVSH();
+	void ShowXmbMode();
+	void ShowRemotePlayCapture();
 	void BootSavestate();
 	void BootRsxCapture(std::string path = "");
 	void DecryptSPRXLibraries();
@@ -206,4 +208,5 @@ private:
 	system_state m_system_state = system_state::stopped;
 	bool m_with_cli_boot = false;
 	bool m_shown = false;
+	bool m_xmb_mode_open = false;
 };

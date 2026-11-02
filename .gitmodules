@@ -121,3 +121,9 @@
 [submodule "3rdparty/spirv-cross/SPIRV-Cross"]
 	path = 3rdparty/spirv-cross/SPIRV-Cross
 	url = ../../KhronosGroup/SPIRV-Cross.git
+[submodule "3rdparty/libdatachannel"]
+	path = 3rdparty/libdatachannel
+	url = https://github.com/paullouisageneau/libdatachannel.git
+[submodule "3rdparty/openh264"]
+	path = 3rdparty/openh264
+	url = https://github.com/cisco/openh264.git

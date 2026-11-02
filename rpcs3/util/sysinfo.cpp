@@ -12,6 +12,7 @@
 #endif
 #ifdef _WIN32
 #include "windows.h"
+#include <psapi.h>
 #include "sysinfoapi.h"
 #include "subauth.h"
 #include "stringapiset.h"

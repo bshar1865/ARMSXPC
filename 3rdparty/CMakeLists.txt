@@ -18,6 +18,17 @@ add_library(3rdparty_dummy_lib INTERFACE)
 
 # ZLib
 add_subdirectory(zlib EXCLUDE_FROM_ALL)
+if(NOT USE_SYSTEM_ZLIB AND WIN32 AND NOT MSVC)
+	# Qt's MinGW multimedia bundle still references the conventional libz.a name,
+	# while this upstream zlib checkout emits libzs.a. Provide the compatibility
+	# archive in the binary tree and make its producer visible to Ninja.
+	set(_armsxpc_libz_compat "${CMAKE_CURRENT_BINARY_DIR}/zlib/zlib/libz.a")
+	add_custom_command(OUTPUT "${_armsxpc_libz_compat}"
+		COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:zlibstatic>" "${_armsxpc_libz_compat}"
+		DEPENDS zlibstatic
+		VERBATIM)
+	add_custom_target(armsxpc_libz_compat DEPENDS "${_armsxpc_libz_compat}")
+endif()
 
 # ZSTD
 add_subdirectory(zstd EXCLUDE_FROM_ALL)
@@ -400,6 +411,48 @@ add_subdirectory(feralinteractive EXCLUDE_FROM_ALL)
 # The subdir returns immediately when the submodule is absent, so a checkout without it still
 # builds; frame generation simply reports itself unavailable at runtime.
 add_subdirectory(lsfg)
+
+# Desktop ARMSX3 Remote Play uses the same standard WebRTC media/data-channel transport as the
+# Android app. Android keeps using its existing stream-webrtc implementation.
+if(NOT ANDROID)
+	set(BUILD_SHARED_LIBS OFF)
+	set(NO_EXAMPLES ON CACHE BOOL "Do not build libdatachannel examples" FORCE)
+	set(NO_TESTS ON CACHE BOOL "Do not build libdatachannel tests" FORCE)
+	set(NO_WEBSOCKET ON CACHE BOOL "Remote Play does not use WebSockets" FORCE)
+	set(USE_GNUTLS OFF CACHE BOOL "Use OpenSSL for libdatachannel" FORCE)
+	set(USE_MBEDTLS OFF CACHE BOOL "Use OpenSSL for libdatachannel" FORCE)
+	set(OPENSSL_USE_STATIC_LIBS ON)
+	get_filename_component(_armsxpc_mingw_root "${CMAKE_CXX_COMPILER}/../.." ABSOLUTE)
+	if(EXISTS "${_armsxpc_mingw_root}/opt/include/openssl/ssl.h")
+		set(OPENSSL_ROOT_DIR "${_armsxpc_mingw_root}/opt" CACHE PATH "OpenSSL used by the MinGW Qt toolchain")
+	endif()
+	add_subdirectory(libdatachannel EXCLUDE_FROM_ALL)
+	set_property(TARGET datachannel PROPERTY EXCLUDE_FROM_ALL TRUE)
+	# RPCS3's FFmpeg build intentionally has no H.264 encoder. ARMSX3 sends baseline H.264,
+	# so build the same software encoder used by the Android compatibility contract.
+	include(ExternalProject)
+	find_program(ARMSXPC_MAKE_EXECUTABLE NAMES mingw32-make gmake make REQUIRED)
+	find_program(ARMSXPC_POSIX_SHELL NAMES sh.exe PATHS "$ENV{ProgramFiles}/Git/usr/bin" "C:/Program Files/Git/usr/bin" NO_DEFAULT_PATH)
+	set(_openh264_make_args
+		-C "${PROJECT_SOURCE_DIR}/3rdparty/openh264"
+		OS=mingw_nt ARCH=x86_64 CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} AR=${CMAKE_AR}
+		USE_ASM=No V=No libopenh264.a)
+	if(ARMSXPC_POSIX_SHELL)
+		list(PREPEND _openh264_make_args "SHELL=${ARMSXPC_POSIX_SHELL}")
+	endif()
+	ExternalProject_Add(armsxpc_openh264_build
+		SOURCE_DIR "${PROJECT_SOURCE_DIR}/3rdparty/openh264"
+		CONFIGURE_COMMAND ""
+		BUILD_COMMAND "${ARMSXPC_MAKE_EXECUTABLE}" ${_openh264_make_args}
+		BUILD_IN_SOURCE TRUE
+		BUILD_BYPRODUCTS "${PROJECT_SOURCE_DIR}/3rdparty/openh264/libopenh264.a"
+		INSTALL_COMMAND ""
+		LOG_BUILD ON)
+	add_library(armsxpc_openh264 STATIC IMPORTED GLOBAL)
+	set_target_properties(armsxpc_openh264 PROPERTIES
+		IMPORTED_LOCATION "${PROJECT_SOURCE_DIR}/3rdparty/openh264/libopenh264.a"
+		INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/3rdparty/openh264/codec/api/wels")
+endif()
 
 # add nice ALIAS targets for ease of use
 if(USE_SYSTEM_LIBUSB)

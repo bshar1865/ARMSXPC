@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include <QJsonDocument>
 #include "config_database.h"
 #include "gui_settings.h"
 #include "downloader.h"

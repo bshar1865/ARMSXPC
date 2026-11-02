@@ -35,7 +35,9 @@ extern atomic_t<u64> g_sema_hist[6];
 #include <string>
 #include <algorithm>
 #include <utility>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include "gcm_printing.h"
 
 // SPU -> PPU event delivery counters, defined in SPUThread.cpp. Neither of that path's two
@@ -2243,9 +2245,10 @@ namespace rsx::prof
 				// dladdr resolves exported names directly; everything else only yields the
 				// module base, which is enough to hand the offset to llvm-symbolizer against
 				// the unstripped core.
-				Dl_info info{};
 				std::string where;
 
+#ifndef _WIN32
+				Dl_info info{};
 				if (addr && dladdr(addr, &info) && info.dli_fbase)
 				{
 					const uptr off = reinterpret_cast<uptr>(addr) - reinterpret_cast<uptr>(info.dli_fbase);
@@ -2257,6 +2260,9 @@ namespace rsx::prof
 				{
 					where = fmt::format("%p", addr);
 				}
+#else
+				where = fmt::format("%p", addr);
+#endif
 
 				fmt::append(list, "\n\t  %-44s %6.1f/frame", where, static_cast<double>(count) / frames);
 			}

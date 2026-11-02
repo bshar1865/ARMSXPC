@@ -6,6 +6,7 @@
 #include "savestate_manager_dialog.h"
 #include "user_manager_dialog.h"
 #include "screenshot_manager_dialog.h"
+#include "screenshot_preview.h"
 #include "kernel_explorer.h"
 #include "game_list_frame.h"
 #include "debugger_frame.h"
@@ -49,6 +50,9 @@
 #include "recording_settings_dialog.h"
 #include "config_database.h"
 #include "guest_memory_dumper.h"
+#include "xmb_mode_dialog.h"
+#include "xmb_firmware.h"
+#include "remote_play_capture_dialog.h"
 
 #include <thread>
 #include <unordered_set>
@@ -58,10 +62,16 @@
 #include <QMimeData>
 #include <QMessageBox>
 #include <QFileDialog>
+#include <QColorDialog>
+#include <QInputDialog>
 #include <QFontDatabase>
 #include <QBuffer>
 #include <QTemporaryFile>
 #include <QDesktopServices>
+#include <QFileInfo>
+#include <QFile>
+#include <QDir>
+#include <QVBoxLayout>
 
 #include "rpcs3_version.h"
 #include "Emu/IdManager.h"
@@ -629,7 +639,7 @@ void main_window::BootElf()
 {
 	bool stopped = false;
 
-	if (Emu.IsRunning())
+	if (!Emu.IsStopped())
 	{
 		Emu.Pause();
 		stopped = true;
@@ -796,6 +806,209 @@ void main_window::BootVSH()
 {
 	gui_log.notice("Booting from BootVSH...");
 	Boot(g_cfg_vfs.get_dev_flash() + "/vsh/module/vsh.self");
+}
+
+void main_window::ShowXmbMode()
+{
+	if (m_xmb_mode_open) return;
+	xmb_firmware firmware(QString::fromStdString(g_cfg_vfs.get_dev_flash()));
+	QString firmware_error;
+	if (!firmware.ready(firmware_error))
+	{
+		QMessageBox::critical(this, tr("ARMSXPC XMB requires PS3 firmware"),
+			tr("Install a complete, valid PS3 firmware before opening the XMB.\n\n%1").arg(firmware_error));
+		return;
+	}
+	m_xmb_mode_open = true;
+	const bool in_game = !Emu.IsStopped();
+	const bool resume_after_xmb = Emu.GetStatus() == system_state::running;
+	game_info running_game;
+	if (in_game && m_game_list_frame)
+	{
+		const std::string serial = Emu.GetTitleID();
+		for (const auto& game : m_game_list_frame->GetGameInfo())
+			if (game && game->serial == serial) { running_game = game; break; }
+	}
+	if (resume_after_xmb) Emu.Pause();
+
+	xmb_mode_dialog dialog(m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, in_game, running_game, this);
+	if (in_game) dialog.setWindowFlag(Qt::WindowStaysOnTopHint, true);
+	connect(&dialog, &xmb_mode_dialog::bootRequested, &dialog, &QDialog::accept);
+	connect(&dialog, &xmb_mode_dialog::actionRequested, this, [this, &dialog, in_game](const QString& action)
+	{
+		if (action.startsWith("settings."))
+		{
+			bool ok = false;
+			const int tab = action.mid(QStringLiteral("settings.").size()).toInt(&ok);
+			if (!ok) return;
+			const gui_game_info* game = nullptr;
+			if (!Emu.IsStopped() && m_game_list_frame)
+				for (const auto& candidate : m_game_list_frame->GetGameInfo())
+					if (candidate && candidate->serial == Emu.GetTitleID()) { game = candidate.get(); break; }
+			auto* settings = new settings_dialog(m_gui_settings, m_emu_settings, std::clamp(tab, 0, 8), this, game);
+			connect(settings, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
+			connect(settings, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
+			connect(settings, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
+			connect(settings, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
+			settings->setAttribute(Qt::WA_DeleteOnClose);
+			settings->open();
+		}
+		else if (action == "remoteplay")
+		{
+			if (in_game)
+			{
+				dialog.accept();
+				QTimer::singleShot(0, this, &main_window::ShowRemotePlayCapture);
+			}
+			else ShowRemotePlayCapture();
+		}
+		else if (action.startsWith("music.play:"))
+		{
+			auto* player = new music_player_dialog(action.mid(QStringLiteral("music.play:").size()), this);
+			player->setAttribute(Qt::WA_DeleteOnClose); player->show();
+		}
+		else if (action == "music.import")
+		{
+			const QStringList files = QFileDialog::getOpenFileNames(&dialog, tr("Import Music"), QString(), tr("Audio files (*.mp3 *.ogg *.wav *.flac *.m4a *.aac *.opus);;All files (*.*)"));
+			const QString root = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/music/");
+			QDir().mkpath(root);
+			for (const QString& source : files)
+			{
+				QFileInfo info(source);
+				QString target = root + info.fileName();
+				for (int suffix = 2; QFile::exists(target); ++suffix)
+					target = root + info.completeBaseName() + QStringLiteral(" (%1).").arg(suffix) + info.suffix();
+				QFile::copy(source, target);
+			}
+			if (!files.isEmpty()) { dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode); }
+		}
+		else if (action == "music")
+		{
+			auto* player = new music_player_dialog(this); player->setAttribute(Qt::WA_DeleteOnClose); player->open();
+		}
+		else if (action == "screenshots")
+		{
+			auto* screenshots = new screenshot_manager_dialog(m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, this);
+			screenshots->setAttribute(Qt::WA_DeleteOnClose); screenshots->show();
+		}
+		else if (action.startsWith("photo.view:"))
+		{
+			const QString path = action.mid(QStringLiteral("photo.view:").size());
+			QDialog viewer(this);
+			viewer.setWindowTitle(QFileInfo(path).fileName());
+			viewer.resize(1100, 760);
+		auto* layout = new QVBoxLayout(&viewer);
+			auto* image = new screenshot_preview(path, &viewer);
+			layout->addWidget(image);
+			viewer.exec();
+		}
+		else if (action == "packages") InstallPackages(this);
+		else if (action == "firmware") InstallPup(this);
+		else if (action == "users") { user_manager_dialog users(m_gui_settings, m_persistent_settings, this); users.exec(); m_game_list_frame->Refresh(true); }
+		else if (action == "padsettings") { pad_settings_dialog pads(m_gui_settings, this); pads.exec(); }
+		else if (action == "boot.file") BootGame();
+		else if (action == "boot.vsh") BootVSH();
+		else if (action == "trophies") { auto* manager = new trophy_manager_dialog(m_gui_settings); connect(this, &main_window::RequestDialogRepaint, manager, &trophy_manager_dialog::HandleRepaintUiRequest); manager->show(); }
+		else if (action == "savedata") { auto* manager = new save_manager_dialog(m_gui_settings, m_persistent_settings); connect(this, &main_window::RequestDialogRepaint, manager, &save_manager_dialog::HandleRepaintUiRequest); manager->show(); }
+		else if (action == "patches") { patch_manager_dialog manager(m_gui_settings, m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, "", "", this); manager.exec(); }
+		else if (action == "rpcn") { rpcn_settings_dialog dialog(this); dialog.exec(); }
+		else if (action == "system.poweroff")
+		{
+			if (QMessageBox::question(this, tr("Turn Off System"), tr("Are you sure you want to exit ARMSXPC?"), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) close();
+		}
+		else if (action == "system.exit")
+		{
+			if (QMessageBox::question(this, tr("Exit ARMSXPC"), tr("Exit ARMSXPC?"), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) close();
+		}
+		else if (action == "game.resume") { if (Emu.GetStatus() == system_state::paused) Emu.Resume(); }
+		else if (action == "game.restart") { if (!Emu.GetBoot().empty()) Emu.Restart(); }
+		else if (action == "game.stop") { if (!Emu.IsStopped()) Emu.GracefulShutdown(false, true); }
+		else if (action == "xmb.background")
+		{
+			const QString path = QFileDialog::getOpenFileName(&dialog, tr("Choose XMB Background"), QString(), tr("Images (*.png *.jpg *.jpeg *.bmp *.webp);;All files (*.*)"));
+			if (!path.isEmpty()) dialog.set_custom_background(path);
+		}
+		else if (action == "xmb.theme.import")
+		{
+			const QString path = QFileDialog::getOpenFileName(&dialog, tr("Import PS3 Theme"), QString(), tr("PS3 themes (*.p3t);;All files (*.*)"));
+			if (!path.isEmpty())
+			{
+				const QString error = dialog.import_p3t_theme(path);
+				if (!error.isEmpty()) QMessageBox::warning(&dialog, tr("PS3 Theme"), error);
+			}
+		}
+		else if (action == "xmb.background.reset") dialog.reset_custom_background();
+		else if (action == "xmb.background.mode")
+		{
+			const QStringList modes{tr("Original PS3 wave"), tr("Original color gradient"), tr("Imported image with firmware wave")};
+			const int current = std::clamp(QSettings().value(QStringLiteral("armsxpc/xmb/backgroundMode"), 0).toInt(), 0, static_cast<int>(modes.size()) - 1);
+			bool ok = false;
+			const QString selected = QInputDialog::getItem(&dialog, tr("XMB Background Style"), tr("Background"), modes, current, false, &ok);
+			if (ok) dialog.set_background_mode(modes.indexOf(selected));
+		}
+		else if (action == "xmb.color")
+		{
+			QStringList months{tr("Automatic (current month)")};
+			for (int month = 1; month <= 12; ++month) months << QLocale().monthName(month, QLocale::LongFormat);
+			const int selected_month = QSettings().value(QStringLiteral("armsxpc/xmb/themeMonth"), -1).toInt();
+			bool ok = false;
+			const QString selected = QInputDialog::getItem(&dialog, tr("XMB Color"), tr("Original theme color"), months, selected_month + 1, false, &ok);
+			if (ok) dialog.set_theme_month(months.indexOf(selected) - 1);
+		}
+		else if (action == "xmb.accent")
+		{
+			const QColor color = QColorDialog::getColor(QColor(255, 255, 255), &dialog, tr("XMB Accent Color"));
+			if (color.isValid()) dialog.set_accent_color(color);
+		}
+		else if (action == "xmb.clock") dialog.toggle_clock();
+		else if (action == "website") QDesktopServices::openUrl(QUrl("https://armsx3.com"));
+		else if (action == "github") QDesktopServices::openUrl(QUrl("https://github.com/ARMSX2/ARMSX3"));
+		else if (action == "about") { QMessageBox::about(this, tr("About ARMSX3"), tr("ARMSX3 XMB frontend running on RPCS3 desktop.")); }
+		else if (action.startsWith("game.play."))
+		{
+			bool ok = false; const int index = action.mid(QStringLiteral("game.play.").size()).toInt(&ok);
+			const auto games = m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{};
+			QVector<game_info> bootable; for (const auto& game : games) if (game && game->bootable) bootable.push_back(game);
+			if (!ok || index < 0 || index >= bootable.size()) return;
+			Boot(bootable[index]->path, bootable[index]->serial);
+		}
+		else if (action.startsWith("game.settings.") || action.startsWith("game.cache."))
+		{
+			const bool open_settings = action.startsWith("game.settings.");
+			const QString prefix = open_settings ? QStringLiteral("game.settings.") : QStringLiteral("game.cache.");
+			bool ok = false; const int index = action.mid(prefix.size()).toInt(&ok);
+			const auto games = m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{};
+			QVector<game_info> bootable; for (const auto& game : games) if (game && game->bootable) bootable.push_back(game);
+			if (!ok || index < 0 || index >= bootable.size()) return;
+			if (open_settings)
+			{
+				auto* dlg = new settings_dialog(m_gui_settings, m_emu_settings, 0, this, bootable[index].get());
+				connect(dlg, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
+				connect(dlg, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
+				connect(dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
+				connect(dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
+				dlg->setAttribute(Qt::WA_DeleteOnClose); dlg->open();
+			}
+			else if (QMessageBox::question(this, tr("Clear Game Cache"), tr("Clear this game's PPU and SPU caches?")) == QMessageBox::Yes)
+			{
+				m_game_list_frame->actions()->BatchRemovePPUCaches({bootable[index]}, false);
+				m_game_list_frame->actions()->BatchRemoveSPUCaches({bootable[index]}, false);
+			}
+		}
+	});
+	connect(&dialog, &xmb_mode_dialog::bootRequested, this, [this](const game_info& game)
+	{
+		Boot(game->path, game->serial);
+	});
+	dialog.exec();
+	if (resume_after_xmb && Emu.GetStatus() == system_state::paused) Emu.Resume();
+	m_xmb_mode_open = false;
+}
+
+void main_window::ShowRemotePlayCapture()
+{
+	remote_play_capture_dialog dialog(this);
+	dialog.exec();
 }
 
 void main_window::BootRsxCapture(std::string path)
@@ -2673,6 +2886,18 @@ void main_window::CreateActions()
 
 	ui->toolbar_start->setEnabled(false);
 	ui->toolbar_stop->setEnabled(false);
+
+	auto* xmb_mode_action = new QAction(tr("ARMSXPC XMB Mode"), this);
+	xmb_mode_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+X")));
+	xmb_mode_action->setShortcutContext(Qt::ApplicationShortcut);
+	ui->menuBar->addAction(xmb_mode_action);
+	connect(xmb_mode_action, &QAction::triggered, this, &main_window::ShowXmbMode);
+
+	auto* remote_play_action = new QAction(tr("ARMSX3 Remote Play Connection Codes"), this);
+	remote_play_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+R")));
+	remote_play_action->setShortcutContext(Qt::ApplicationShortcut);
+	ui->menuBar->addAction(remote_play_action);
+	connect(remote_play_action, &QAction::triggered, this, &main_window::ShowRemotePlayCapture);
 
 	m_category_visible_act_group = new QActionGroup(this);
 	m_category_visible_act_group->addAction(ui->showCatHDDGameAct);

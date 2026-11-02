@@ -18,5 +18,7 @@
         <file>rpcs3.svg</file>
         <file>Icons/DualShock_3.svg</file>
         <file>Icons/rpcn.png</file>
+        <file alias="armsx3_xmb_bg.jpg">../android/armsx3-ui/app/src/main/res/drawable-nodpi/library_bg_xmb.jpg</file>
+        <file alias="xmb/wave_state.bin">../android/armsx3-ui/app/src/main/assets/xmb/wave_state.bin</file>
     </qresource>
 </RCC>

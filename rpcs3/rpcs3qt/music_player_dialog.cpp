@@ -25,6 +25,16 @@ music_player_dialog::music_player_dialog(QWidget* parent)
 	connect(ui->volumeSlider, &QSlider::valueChanged, this, [this](int value){ m_handler->set_volume(std::clamp(value / 100.0f, 0.0f, 1.0f)); });
 }
 
+music_player_dialog::music_player_dialog(const QString& file_path, QWidget* parent)
+	: music_player_dialog(parent)
+{
+	if (!file_path.isEmpty())
+	{
+		m_file_path = file_path.toStdString();
+		m_handler->play(m_file_path);
+	}
+}
+
 music_player_dialog::~music_player_dialog()
 {
 }

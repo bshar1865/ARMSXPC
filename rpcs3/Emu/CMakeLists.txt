@@ -152,10 +152,15 @@ target_sources(rpcs3_emu PRIVATE
     Audio/AudioDumper.cpp
     Audio/AudioBackend.cpp
     Audio/Cubeb/CubebBackend.cpp
-    Audio/Oboe/OboeBackend.cpp
-    Audio/Oboe/OboeCapture.cpp
     Audio/Cubeb/cubeb_enumerator.cpp
 )
+
+if(ANDROID)
+    target_sources(rpcs3_emu PRIVATE
+        Audio/Oboe/OboeBackend.cpp
+        Audio/Oboe/OboeCapture.cpp
+    )
+endif()
 
 if(USE_FAUDIO)
     find_package(SDL3)
@@ -170,7 +175,9 @@ endif()
 
 if(WIN32)
     if(NOT MSVC)
-        target_link_libraries(rpcs3_emu PRIVATE xaudio2_9)
+        # MinGW distributions provide the XAudio2 2.8 import library; the
+        # 2.9 import library is part of the MSVC Windows SDK.
+        target_link_libraries(rpcs3_emu PRIVATE xaudio2_8)
     endif()
     target_sources(rpcs3_emu PRIVATE
         Audio/XAudio2/XAudio2Backend.cpp
@@ -595,6 +602,7 @@ target_sources(rpcs3_emu PRIVATE
     RSX/RSXThread.cpp
     RSX/RSXZCULL.cpp
     RSX/rsx_methods.cpp
+    RSX/rsx_frame_dump.cpp
     RSX/rsx_profiler.cpp
     RSX/rsx_vertex_data.cpp
     RSX/Utils/rsx_utils.cpp
@@ -730,6 +738,10 @@ if(TARGET 3rdparty_vulkan)
             RSX/VK/vkutils/metal_layer.mm
         )
     endif()
+endif()
+
+if(NOT TARGET 3rdparty_vulkan)
+    target_sources(rpcs3_emu PRIVATE RSX/VK/VKFrameGenStub.cpp)
 endif()
 
 if(NOT WIN32)

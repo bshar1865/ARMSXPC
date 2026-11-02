@@ -91,6 +91,11 @@ add_library(rpcs3_ui STATIC
     raw_mouse_settings_dialog.cpp
     register_editor_dialog.cpp
     recording_settings_dialog.cpp
+    remote_play_capture.cpp
+    remote_play_capture_dialog.cpp
+    remote_play_lobby.cpp
+    remote_play_protocol.cpp
+    remote_play_webrtc.cpp
     recvmessage_dialog_frame.cpp
     render_creator.cpp
     rpcn_settings_dialog.cpp
@@ -132,6 +137,11 @@ add_library(rpcs3_ui STATIC
     vfs_tool_dialog.cpp
     video_label.cpp
     welcome_dialog.cpp
+    xmb_mode_dialog.cpp
+    xmb_p3t.cpp
+    xmb_firmware.cpp
+    xmb_wave_model.cpp
+    xmb_wave_widget.cpp
 
     about_dialog.ui
     camera_settings_dialog.ui
@@ -193,8 +203,15 @@ endif()
 
 if(WIN32)
     target_sources(rpcs3_ui PRIVATE "../windows.qrc")
+    if(MSVC)
+        set(RPCS3_QT_PREFIX "")
+    else()
+        set(RPCS3_QT_PREFIX "share/qt6/")
+    endif()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/qt.conf"
+        "[Paths]\nPrefix = ${RPCS3_QT_PREFIX}\nPlugins = plugins\nTranslations = translations\n")
     set_source_files_properties("../windows.qrc" PROPERTIES 
-        RCC_OPTIONS "--include;${CMAKE_CURRENT_SOURCE_DIR}/../qt/etc/qt.conf"
+        RCC_OPTIONS "--include;${CMAKE_CURRENT_BINARY_DIR}/qt.conf"
     )
     target_compile_definitions(rpcs3_ui PRIVATE UNICODE _UNICODE)
 endif()
@@ -213,6 +230,9 @@ target_compile_definitions(rpcs3_ui PRIVATE WIN32_LEAN_AND_MEAN)
 
 # We need to know where our custom widgets are located when compiling form files
 target_include_directories(rpcs3_ui AFTER PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(rpcs3_ui SYSTEM BEFORE PRIVATE
+	${PROJECT_SOURCE_DIR}/3rdparty/libdatachannel/include
+	${PROJECT_SOURCE_DIR}/3rdparty/openh264/codec/api/wels)
 
 target_link_libraries(rpcs3_ui
     PUBLIC
@@ -232,4 +252,10 @@ target_link_libraries(rpcs3_ui
         3rdparty::pugixml
         3rdparty::libpng
         3rdparty::7zip
-        3rdparty::rtmidi)
+        3rdparty::rtmidi
+        LibDataChannel::LibDataChannelStatic
+        armsxpc_openh264)
+
+if(TARGET armsxpc_openh264_build)
+	add_dependencies(rpcs3_ui armsxpc_openh264_build)
+endif()
