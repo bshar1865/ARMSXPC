@@ -143,6 +143,7 @@ add_library(rpcs3_ui STATIC
     xmb_firmware.cpp
     xmb_wave_model.cpp
     xmb_wave_widget.cpp
+    ../../android/src/xmb-media.cpp
 
     about_dialog.ui
     camera_settings_dialog.ui

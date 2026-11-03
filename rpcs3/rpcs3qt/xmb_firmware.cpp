@@ -346,6 +346,37 @@ xmb_firmware::container* xmb_firmware::load(const QString& name)
 		if (!next || quint64(entry) + next > quint64(data.table.size())) break;
 		entry += next;
 	}
+	const quint32 sound_table = be32(data.table, 0x1c), sound_data = be32(data.file, 0x88);
+	if (sound_table != none && sound_data != none && sound_table + header_size <= quint32(data.table.size()))
+	{
+		const quint32 sound_count = be32(data.table, sound_table + 0x10);
+		if (sound_count <= 4096)
+		{
+			quint32 sound_entry = sound_table + header_size;
+			for (quint32 i = 0; i < sound_count && sound_entry + header_size <= quint32(data.table.size()); ++i)
+			{
+				const QString key = label(data.table, labels_at, be32(data.table, sound_entry + 4));
+				const quint16 format = be16(data.table, sound_entry + 0x28);
+				const quint8 channel_count = sound_entry + 0x2a < quint32(data.table.size()) ? static_cast<quint8>(data.table[sound_entry + 0x2a]) : 0;
+				QVector<QByteArray> channels;
+				if (format == 1 && !key.isEmpty() && channel_count >= 1 && channel_count <= 2)
+				{
+					for (quint8 channel = 0; channel < channel_count; ++channel)
+					{
+						const quint32 size = be32(data.table, sound_entry + 0x34 + 8 * channel);
+						const quint32 offset = be32(data.table, sound_entry + 0x38 + 8 * channel);
+						if (!size || size > (4 << 20) || quint64(sound_data) + offset + size > quint64(data.file.size())) { channels.clear(); break; }
+						channels.push_back(data.file.mid(sound_data + offset, size));
+					}
+					const QByteArray wav = decode_vag_audio(channels);
+					if (!wav.isEmpty()) data.sounds.insert(key, wav);
+				}
+				const quint32 next = be32(data.table, sound_entry + 0x14);
+				if (!next || quint64(sound_entry) + next > quint64(data.table.size())) break;
+				sound_entry += next;
+			}
+		}
+	}
 	return &m_containers.insert(name, std::move(data)).value();
 }
 
@@ -373,6 +404,74 @@ QImage xmb_firmware::image(const QString& rco, const QString& name)
 		return decoded;
 	}
 	return {};
+}
+
+QByteArray xmb_firmware::sound(const QString& rco, const QString& name)
+{
+	if (auto* resource = load(rco)) return resource->sounds.value(name);
+	return {};
+}
+
+QByteArray xmb_firmware::decode_vag_audio(const QVector<QByteArray>& channels)
+{
+	if (channels.isEmpty() || channels.size() > 2) return {};
+	constexpr int coef0[5] = {0, 60, 115, 98, 122};
+	constexpr int coef1[5] = {0, 0, -52, -55, -60};
+	QVector<QVector<qint16>> decoded;
+	int sample_rate = 0;
+	for (const QByteArray& vag : channels)
+	{
+		if (vag.size() < 48 || !vag.startsWith("VAGp")) return {};
+		const quint32 size = std::min(be32(vag, 12), quint32(vag.size() - 48));
+		const quint32 rate = be32(vag, 16);
+		if (rate < 8000 || rate > 96000 || size > (8u << 20)) return {};
+		if (sample_rate && sample_rate != static_cast<int>(rate)) return {};
+		sample_rate = static_cast<int>(rate);
+		QVector<qint16> pcm;
+		pcm.reserve(static_cast<qsizetype>(size / 16 * 28));
+		int h1 = 0, h2 = 0;
+		for (quint32 frame = 48; frame + 16 <= 48 + size; frame += 16)
+		{
+			const quint8 predictor_shift = static_cast<quint8>(vag[frame]);
+			const int predictor = predictor_shift >> 4;
+			const int shift = predictor_shift & 0x0f;
+			if (static_cast<quint8>(vag[frame + 1]) == 7) break;
+			const int c0 = predictor < 5 ? coef0[predictor] : 0;
+			const int c1 = predictor < 5 ? coef1[predictor] : 0;
+			for (int i = 0; i < 28; ++i)
+			{
+				const quint8 byte = static_cast<quint8>(vag[frame + 2 + i / 2]);
+				const int nibble = (byte >> (4 * (i & 1))) & 0x0f;
+				int sample = (nibble >= 8 ? nibble - 16 : nibble) << 12;
+				sample >>= shift;
+				sample += (h1 * c0 + h2 * c1 + 32) >> 6;
+				sample = std::clamp(sample, -32768, 32767);
+				pcm.push_back(static_cast<qint16>(sample));
+				h2 = h1; h1 = sample;
+			}
+		}
+		decoded.push_back(std::move(pcm));
+	}
+	qsizetype frames = decoded.front().size();
+	for (const auto& channel : decoded) frames = std::min(frames, channel.size());
+	if (!frames || !sample_rate) return {};
+	const quint16 channel_count = static_cast<quint16>(decoded.size());
+	const quint32 data_size = static_cast<quint32>(frames * channel_count * 2);
+	QByteArray wav(44 + data_size, '\0');
+	std::memcpy(wav.data(), "RIFF", 4); std::memcpy(wav.data() + 8, "WAVEfmt ", 8);
+	auto put16 = [&](int at, quint16 value) { wav[at] = static_cast<char>(value); wav[at + 1] = static_cast<char>(value >> 8); };
+	auto put32 = [&](int at, quint32 value) { for (int i = 0; i < 4; ++i) wav[at + i] = static_cast<char>(value >> (8 * i)); };
+	put32(4, 36 + data_size); put32(16, 16); put16(20, 1); put16(22, channel_count);
+	put32(24, sample_rate); put32(28, sample_rate * channel_count * 2); put16(32, channel_count * 2); put16(34, 16);
+	std::memcpy(wav.data() + 36, "data", 4); put32(40, data_size);
+	qsizetype at = 44;
+	for (qsizetype i = 0; i < frames; ++i)
+		for (const auto& channel : decoded)
+		{
+			const quint16 sample = static_cast<quint16>(channel[i]);
+			wav[at++] = static_cast<char>(sample); wav[at++] = static_cast<char>(sample >> 8);
+		}
+	return wav;
 }
 
 QString xmb_firmware::text(const QString& rco, const QString& key, int language)

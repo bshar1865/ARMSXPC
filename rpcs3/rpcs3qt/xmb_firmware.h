@@ -16,12 +16,14 @@ public:
 	// substitute UI when this check fails.
 	bool ready(QString& reason);
 	QImage image(const QString& rco, const QString& name);
+	QByteArray sound(const QString& rco, const QString& name);
 	QString text(const QString& rco, const QString& key, int language = 1);
 	QByteArray wave_file(const QString& name);
 	float wave_value(const QString& name, float fallback);
 	QColor wave_colour(int index, const QColor& fallback);
 	QVector<float> wave_strands();
 	static QImage decode_gim_image(const QByteArray& bytes);
+	static QByteArray decode_vag_audio(const QVector<QByteArray>& channels);
 	QString font_family() const { return m_font_family; }
 
 private:
@@ -34,11 +36,13 @@ private:
 	};
 	struct container
 	{
+		struct sound_entry { quint32 offset = 0; quint32 size = 0; };
 		QByteArray file;
 		QByteArray table;
 		QHash<QString, image_entry> images;
 		QHash<QString, QImage> decoded_images;
 		QHash<QString, QString> strings;
+		QHash<QString, QByteArray> sounds;
 	};
 	QString m_dev_flash;
 	QString m_font_family;

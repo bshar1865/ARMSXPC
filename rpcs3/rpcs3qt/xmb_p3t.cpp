@@ -215,6 +215,36 @@ xmb_p3t::result xmb_p3t::read(const QString& path)
 				}
 			}
 		}
+		else if (element == QStringLiteral("se"))
+		{
+			QString id;
+			QVector<QPair<quint64, quint64>> channels;
+			for (quint32 i = 0; i < count; ++i)
+			{
+				const qsizetype a = at + element_bytes + static_cast<qsizetype>(i) * attribute_bytes;
+				const QString attr = c_string(strings, be32(elements, a));
+				const quint32 type = be32(elements, a + 4);
+				const quint64 first = be32(elements, a + 8), second = be32(elements, a + 12);
+				if (attr == QStringLiteral("id") && type == type_id && range_ok(first + 4, 1, static_cast<quint64>(ids.size())))
+					id = c_string(ids, static_cast<quint32>(first + 4));
+				else if ((attr == QStringLiteral("left") || attr == QStringLiteral("right")) && type == type_file)
+					channels.push_back({first, second});
+			}
+			QVector<QByteArray> vag_channels;
+			for (const auto& [offset, size] : channels)
+			{
+				if (size < 48 || size > max_icon || !range_ok(offset, size, files_ref.size)) { vag_channels.clear(); break; }
+				if (!file.seek(static_cast<qint64>(files_ref.offset + offset))) { vag_channels.clear(); break; }
+				const QByteArray bytes = file.read(static_cast<qint64>(size));
+				if (static_cast<quint64>(bytes.size()) != size) { vag_channels.clear(); break; }
+				vag_channels.push_back(bytes);
+			}
+			if (!id.isEmpty() && !vag_channels.isEmpty())
+			{
+				const QByteArray wav = xmb_firmware::decode_vag_audio(vag_channels);
+				if (!wav.isEmpty()) out.sounds.insert(id, wav);
+			}
+		}
 		position += element_bytes + static_cast<quint64>(count) * attribute_bytes;
 	}
 	if (out.background.isNull() && preview_size && file.seek(static_cast<qint64>(preview_offset)))

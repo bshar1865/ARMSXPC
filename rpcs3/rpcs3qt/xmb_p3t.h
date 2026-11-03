@@ -14,6 +14,7 @@ public:
 		QString name;
 		QImage background;
 		QHash<QString, QImage> icons;
+		QHash<QString, QByteArray> sounds;
 		quint64 animation_offset = 0;
 		quint64 animation_size = 0;
 		bool dynamic = false;

@@ -18,6 +18,9 @@ class xmb_wave_model;
 class xmb_wave_widget;
 
 class QTimer;
+class QAudioOutput;
+class QMediaPlayer;
+class QSoundEffect;
 template <typename T> class QFutureWatcher;
 
 // Desktop rendition of the ARMSX3 phone XMB, laid out in the same 1280x720 console space.
@@ -37,6 +40,7 @@ public:
 	void toggle_game_version();
 	void toggle_game_region();
 	void toggle_game_backgrounds();
+	void toggle_animated_game_icons();
 
 Q_SIGNALS:
 	void bootRequested(const game_info& game);
@@ -82,6 +86,8 @@ private:
 	QElapsedTimer m_p3t_slide_clock;
 	int m_p3t_slide_start = 0;
 	QHash<QString, QImage> m_p3t_icons;
+	QHash<QString, QByteArray> m_p3t_sounds;
+	QHash<QString, QSoundEffect*> m_menu_sounds;
 	int m_background_mode = 0; // 0 Original firmware wave, 1 the Android 2D gradient, 2 imported image
 	int m_theme_month = -1; // -1 follows the calendar, 0..11 pins a month
 	QColor m_accent_color = QColor(255, 255, 255);
@@ -89,6 +95,7 @@ private:
 	bool m_show_game_version = false;
 	bool m_show_game_region = false;
 	bool m_show_game_backgrounds = true;
+	bool m_show_animated_game_icons = true;
 	int m_column = 5;
 	QVector<int> m_focus;
 	QVector<int> m_path;
@@ -113,6 +120,21 @@ private:
 	QTimer* m_game_backdrop_delay = nullptr;
 	QFutureWatcher<QImage>* m_game_backdrop_watcher = nullptr;
 	QFutureWatcher<QHash<int, QImage>>* m_game_icon_watcher = nullptr;
+	QFutureWatcher<QPair<QVector<QImage>, QVector<qint64>>>* m_game_pam_watcher = nullptr;
+	QTimer* m_game_pam_timer = nullptr;
+	QVector<QImage> m_game_pam_frames;
+	QVector<qint64> m_game_pam_timestamps;
+	QElapsedTimer m_game_pam_clock;
+	int m_game_pam_target = -1;
+	int m_game_pam_loading = -1;
+	int m_game_pam_display = -1;
+	int m_game_pam_frame = 0;
+	QTimer* m_game_audio_delay = nullptr;
+	QFutureWatcher<QString>* m_game_audio_watcher = nullptr;
+	QMediaPlayer* m_game_audio_player = nullptr;
+	QAudioOutput* m_game_audio_output = nullptr;
+	int m_game_audio_target = -1;
+	int m_game_audio_loading = -1;
 	QString m_game_backdrop_key;
 	QString m_game_backdrop_loading_key;
 	game_info m_game_backdrop_pending;
@@ -121,10 +143,16 @@ private:
 	int& current_focus();
 	void rebuild_items();
 	void apply_p3t_icons();
+	void load_menu_sounds();
+	void play_menu_sound(const QString& sound);
 	void update_game_version_labels();
 	QString game_subtitle(int index) const;
 	void refresh_game_backdrop();
 	void load_game_backdrop();
 	void load_missing_game_icons();
+	void refresh_focused_game_animation();
+	void start_game_animation_load(int index);
+	void refresh_focused_game_audio();
+	void start_game_audio_load(int index);
 	void launch_selected();
 };
