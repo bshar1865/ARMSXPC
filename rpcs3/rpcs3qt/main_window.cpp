@@ -940,7 +940,7 @@ void main_window::ShowXmbMode()
 		else if (action == "xmb.background.reset") dialog.reset_custom_background();
 		else if (action == "xmb.background.mode")
 		{
-			const QStringList modes{tr("Original PS3 wave"), tr("Original color gradient"), tr("Imported image with firmware wave")};
+			const QStringList modes{tr("PS3 Firmware Wave"), tr("ARMSX3 Simple Wave"), tr("Custom Image with PS3 Wave")};
 			const int current = std::clamp(QSettings().value(QStringLiteral("armsxpc/xmb/backgroundMode"), 0).toInt(), 0, static_cast<int>(modes.size()) - 1);
 			bool ok = false;
 			const QString selected = QInputDialog::getItem(&dialog, tr("XMB Background Style"), tr("Background"), modes, current, false, &ok);
@@ -950,10 +950,12 @@ void main_window::ShowXmbMode()
 		{
 			QStringList months{tr("Automatic (current month)")};
 			for (int month = 1; month <= 12; ++month) months << QLocale().monthName(month, QLocale::LongFormat);
-			const int selected_month = QSettings().value(QStringLiteral("armsxpc/xmb/themeMonth"), -1).toInt();
+			months << tr("Cycle all colors");
+			const int saved_month = QSettings().value(QStringLiteral("armsxpc/xmb/themeMonth"), -1).toInt();
+			const int selected_month = saved_month == 12 ? 13 : saved_month + 1;
 			bool ok = false;
-			const QString selected = QInputDialog::getItem(&dialog, tr("XMB Color"), tr("Original theme color"), months, selected_month + 1, false, &ok);
-			if (ok) dialog.set_theme_month(months.indexOf(selected) - 1);
+			const QString selected = QInputDialog::getItem(&dialog, tr("XMB Color"), tr("Original theme color"), months, selected_month, false, &ok);
+			if (ok) { const int index = months.indexOf(selected); dialog.set_theme_month(index == 13 ? 12 : index - 1); }
 		}
 		else if (action == "xmb.accent")
 		{

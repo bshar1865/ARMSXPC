@@ -50,6 +50,25 @@ namespace
 		painter.drawImage(target, image, source);
 	}
 
+	QImage load_game_icon_image(const game_info& game)
+	{
+		if (!game) return {};
+		const auto [path, in_archive] = rpcs3::utils::get_game_content_path(game_content_type::content_icon, *game);
+		if (path.empty()) return {};
+		if (!in_archive) return QImageReader(QString::fromStdString(path)).read();
+		iso_archive archive(game->path);
+		if (!archive.is_valid()) return {};
+		auto stream = archive.open(path);
+		if (!stream) return {};
+		const u64 size = stream->size();
+		if (!size || size > (16ull << 20)) return {};
+		QByteArray data(static_cast<qsizetype>(size), Qt::Uninitialized);
+		if (stream->read(data.data(), size) != size) return {};
+		QImage image;
+		image.loadFromData(data, "PNG");
+		return image;
+	}
+
 	struct xmb_gradient { qreal angle; QColor start; QColor end; };
 	const std::array<xmb_gradient, 12> original_gradients{{
 		{90.25, QColor(0xC5,0xC5,0xC5), QColor(0xC9,0xC9,0xC9)}, {67, QColor(0xCB,0x9E,0x0D), QColor(0xDB,0xD6,0x29)},
@@ -62,15 +81,35 @@ namespace
 	void fill_original_background(QPainter& p, qreal w, qreal h, int pinned_month)
 	{
 		const QDateTime now = QDateTime::currentDateTime();
-		const int month = pinned_month >= 0 && pinned_month < 12 ? pinned_month : now.date().month() - 1;
-		const auto& g = original_gradients[month];
+		int month = pinned_month >= 0 && pinned_month < 12 ? pinned_month : now.date().month() - 1;
+		qreal angle = original_gradients[month].angle;
+		QColor start = original_gradients[month].start;
+		QColor end = original_gradients[month].end;
+		if (pinned_month == 12)
+		{
+			constexpr qreal cycle_month_ms = 20000.0;
+			const qreal t = std::fmod(QDateTime::currentMSecsSinceEpoch(), 12.0 * cycle_month_ms) / cycle_month_ms;
+			month = static_cast<int>(t) % 12;
+			const qreal phase = t - std::floor(t);
+			const qreal x = std::clamp((phase - .75) / .25, 0.0, 1.0);
+			const qreal blend = x * x * (3.0 - 2.0 * x);
+			const auto& a = original_gradients[month];
+			const auto& b = original_gradients[(month + 1) % 12];
+			angle = a.angle + (b.angle - a.angle) * blend;
+			start = QColor::fromRgbF(a.start.redF() + (b.start.redF() - a.start.redF()) * blend,
+				a.start.greenF() + (b.start.greenF() - a.start.greenF()) * blend,
+				a.start.blueF() + (b.start.blueF() - a.start.blueF()) * blend);
+			end = QColor::fromRgbF(a.end.redF() + (b.end.redF() - a.end.redF()) * blend,
+				a.end.greenF() + (b.end.greenF() - a.end.greenF()) * blend,
+				a.end.blueF() + (b.end.blueF() - a.end.blueF()) * blend);
+		}
 		const qreal hour = now.time().hour() + now.time().minute() / 60.0;
 		qreal night = 0;
 		const auto ease = [](qreal x) { x = std::clamp(x, 0.0, 1.0); return x*x*(3-2*x); };
 		if (hour < 4) night = 1; else if (hour < 6.5) night = 1-ease((hour-4)/2.5); else if (hour >= 23) night = ease(hour-23);
 		const qreal start_scale = 1 + (.10-1)*night, end_scale = 1 + (.30-1)*night;
 		const auto scale_color = [](QColor c, qreal f) { return QColor::fromRgbF(c.redF()*f, c.greenF()*f, c.blueF()*f); };
-		const qreal radians = qDegreesToRadians(g.angle);
+		const qreal radians = qDegreesToRadians(angle);
 		const QPointF dir(std::sin(radians), -std::cos(radians));
 		const std::array<QPointF, 4> corners{QPointF(0,0), QPointF(w,0), QPointF(0,h), QPointF(w,h)};
 		qreal lo = std::numeric_limits<qreal>::max(), hi = std::numeric_limits<qreal>::lowest();
@@ -78,8 +117,51 @@ namespace
 		const QPointF center(w / 2, h / 2);
 		const qreal center_projection = QPointF::dotProduct(center, dir);
 		QLinearGradient bg(center + dir * (lo - center_projection), center + dir * (hi - center_projection));
-		bg.setColorAt(0, scale_color(g.start, start_scale)); bg.setColorAt(1, scale_color(g.end, end_scale));
+		bg.setColorAt(0, scale_color(start, start_scale)); bg.setColorAt(1, scale_color(end, end_scale));
 		p.fillRect(QRectF(0,0,w,h), bg);
+	}
+
+	void fill_simple_wave(QPainter& p, qreal w, qreal h, qreal t, int pinned_month)
+	{
+		int month = pinned_month >= 0 && pinned_month < 12 ? pinned_month : QDate::currentDate().month() - 1;
+		if (pinned_month == 12) month = static_cast<int>(std::fmod(QDateTime::currentMSecsSinceEpoch(), 240000.0) / 20000.0) % 12;
+		const QColor base = original_gradients[month].end;
+		constexpr int samples = 64;
+		const qreal step = w / samples;
+		const qreal two_pi = 2.0 * qAcos(-1.0);
+		for (int layer = 0; layer < 4; ++layer)
+		{
+			const qreal f = layer / 3.0;
+			const qreal base_y = h * (.40 + .16 * f);
+			const qreal amp = h * (.05 + .028 * (1.0 - f));
+			const qreal length = 1.05 + .5 * f;
+			const qreal phase = t * (.26 + .14 * f) + layer * 2.2;
+			const auto wave_y = [=](qreal nx)
+			{
+				return base_y + amp * std::sin(nx * length * two_pi + phase)
+					+ amp * .34 * std::sin(nx * length * 2.1 * two_pi - phase * 1.35 + layer);
+			};
+			QPainterPath body;
+			body.moveTo(0, h + 2);
+			for (int i = 0; i <= samples; ++i) body.lineTo(i * step, wave_y(qreal(i) / samples));
+			body.lineTo(w, h + 2); body.closeSubpath();
+			const QColor tint = base.lighter(130 + int(22 * f));
+			QLinearGradient fill(0, base_y - amp * 1.6, 0, h);
+			fill.setColorAt(0, QColor(tint.red(), tint.green(), tint.blue(), 0));
+			fill.setColorAt(.05, QColor(tint.red(), tint.green(), tint.blue(), 26 + int(13 * f)));
+			fill.setColorAt(.55, QColor(base.red(), base.green(), base.blue(), 10 + int(8 * f)));
+			fill.setColorAt(1, QColor(base.red(), base.green(), base.blue(), 0));
+			p.fillPath(body, fill);
+			QPainterPath crest;
+			for (int i = 0; i <= samples; ++i)
+			{
+				const QPointF point(i * step, wave_y(qreal(i) / samples));
+				if (!i) crest.moveTo(point); else crest.lineTo(point);
+			}
+			QColor line = tint; line.setAlpha(18 + int(18 * f));
+			p.setPen(QPen(line, std::min(w, h) * (.008 + .004 * f), Qt::SolidLine, Qt::RoundCap));
+			p.setBrush(Qt::NoBrush); p.drawPath(crest);
+		}
 	}
 	// Port of XmbWordmark.three()/markBadge() from ARMSX3's Android XMB. Keep these
 	// dimensions in letter heights so the Windows badge follows the source geometry exactly.
@@ -166,7 +248,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		else { m_p3t_theme_path.clear(); preferences.remove(QStringLiteral("p3tTheme")); }
 	}
 	m_background_mode = std::clamp(preferences.value(QStringLiteral("backgroundMode"), 0).toInt(), 0, 2);
-	m_theme_month = std::clamp(preferences.value(QStringLiteral("themeMonth"), -1).toInt(), -1, 11);
+	m_theme_month = std::clamp(preferences.value(QStringLiteral("themeMonth"), -1).toInt(), -1, 12);
 	if (preferences.value(QStringLiteral("themeMonth"), -1).toInt() < 0) m_theme_month = -1;
 	m_accent_color = preferences.value(QStringLiteral("accent"), QColor(255, 255, 255)).value<QColor>();
 	m_show_clock = preferences.value(QStringLiteral("showClock"), true).toBool();
@@ -177,6 +259,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	for (int i = 0; i < m_focus.size(); ++i) m_focus[i] = std::max(0, preferences.value(QStringLiteral("focus/%1").arg(i), m_focus[i]).toInt());
 	m_visual_column = static_cast<float>(m_column);
 	m_firmware = std::make_unique<xmb_firmware>(QString::fromStdString(g_cfg_vfs.get_dev_flash()));
+	m_default_game_icon = m_firmware->image("explore_category_game", "item_tex_ps3util");
 	m_wave_model = std::make_unique<xmb_wave_model>(*m_firmware);
 	m_wave_widget = new xmb_wave_widget(*m_wave_model, *m_firmware, this);
 	m_wave_widget->setGeometry(rect());
@@ -224,7 +307,6 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		folder("settings.display", tr("Display Settings"), QString::fromUtf8("▣"), {leaf("settings.display.graphics", tr("Graphics Settings"), QString::fromUtf8("▣"), "settings.1")}),
 		folder("settings.sound", tr("Sound Settings"), QString::fromUtf8("♫"), {leaf("settings.sound.audio", tr("Audio Settings"), QString::fromUtf8("♫"), "settings.2")}),
 		folder("settings.network", tr("Network Settings"), QString::fromUtf8("◎"), {leaf("settings.network.open", tr("Network Settings"), QString::fromUtf8("◎"), "settings.5"), leaf("settings.rpcn", tr("RPCN Account"), QString::fromUtf8("♙"), "rpcn")}),
-		folder("settings.debug", tr("Debug Settings"), QString::fromUtf8("⚙"), {leaf("settings.advanced", tr("Advanced Settings"), QString::fromUtf8("⚙"), "settings.6")})
 	};
 	for (item& node : m_items[1])
 		if (node.key == "settings.theme")
@@ -235,15 +317,16 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 				leaf("settings.theme.color", tr("XMB Color"), QString::fromUtf8("\u25ce"), "xmb.color"),
 				leaf("settings.theme.reset", tr("Restore ARMSX3 Background"), QString::fromUtf8("\u21ba"), "xmb.background.reset"),
 				leaf("settings.theme.accent", tr("XMB Accent Color"), QString::fromUtf8("\u25ce"), "xmb.accent"),
-			leaf("settings.theme.gameBackgrounds", tr("Show Game Backgrounds (PIC1)"), QString::fromUtf8("\u25a7"), "xmb.gameBackgrounds",
+				leaf("settings.theme.gameBackgrounds", tr("Show Game Backgrounds (PIC1)"), QString::fromUtf8("\u25a7"), "xmb.gameBackgrounds",
 				m_show_game_backgrounds ? tr("On") : tr("Off")),
 				leaf("settings.theme.clock", tr("Show / Hide Clock"), QString::fromUtf8("\u25f7"), "xmb.clock"),
 				leaf("settings.theme.gui", tr("RPCS3 Interface Settings"), QString::fromUtf8("\u2699"), "settings.8")
 			};
-	m_items[1].push_back(folder("settings.armsx3", tr("ARMSX3 Settings"), QString::fromUtf8("\u2699"), {
+	m_items[1].push_back(folder("settings.xmb", tr("XMB Settings"), QString::fromUtf8("\u2699"), {
 		leaf("armsx3.background", tr("XMB Background"), QString::fromUtf8("\u25a7"), "xmb.background"),
 		leaf("armsx3.accent", tr("XMB Accent Color"), QString::fromUtf8("\u25ce"), "xmb.accent"),
 		leaf("armsx3.clock", tr("XMB Clock"), QString::fromUtf8("\u25f7"), "xmb.clock"),
+		leaf("armsx3.advanced", tr("Advanced Settings"), QString::fromUtf8("\u2699"), "settings.6"),
 		leaf("armsx3.remoteplay", tr("Remote Play Setup"), QString::fromUtf8("\u25ce"), "remoteplay"),
 		leaf("armsx3.gameRegion", tr("Show Game Region Number"), QString::fromUtf8("\u25ce"), "xmb.gameRegion",
 			m_show_game_region ? tr("On") : tr("Off")),
@@ -344,7 +427,6 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	fw_title(m_items[1][7], "explore_category_sysconf", "msg_display_setting");
 	fw_title(m_items[1][8], "explore_category_sysconf", "msg_sound_setting");
 	fw_title(m_items[1][9], "explore_category_sysconf", "msg_net_setting");
-	fw_title(m_items[1][10], "explore_category_sysconf", "msg_tool_debug_settings");
 	// Resolve artwork from the installed PS3 firmware. Missing firmware icons are never replaced by
 	// Unicode glyphs or desktop-drawn stand-ins.
 	std::function<void(item&)> resolve_icons = [&](item& node)
@@ -361,7 +443,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		else if (key.startsWith("settings.display")) { rco = "explore_category_sysconf"; image = "tex_display"; }
 		else if (key.startsWith("settings.sound")) { rco = "explore_category_sysconf"; image = "tex_sound"; }
 		else if (key.startsWith("settings.network")) { rco = "explore_category_sysconf"; image = "tex_network"; }
-		else if (key.startsWith("settings.debug")) { rco = "explore_category_sysconf"; image = "tex_security"; }
+		else if (key.startsWith("settings.debug") || key.startsWith("settings.xmb")) { rco = "explore_category_sysconf"; image = "tex_security"; }
 		else if (key.startsWith("photo.")) { rco = "explore_category_photo"; image = "photo_tex_folder"; }
 		else if (key.startsWith("music.")) { rco = "explore_category_music"; image = "music_tex_default"; }
 		else if (key.startsWith("game.packages")) { rco = "explore_category_game"; image = "item_tex_plain_folder"; }
@@ -444,6 +526,16 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		if (loaded_key != m_game_backdrop_key && !m_game_backdrop_key.isEmpty()) m_game_backdrop_delay->start(0);
 		update();
 	});
+	m_game_icon_watcher = new QFutureWatcher<QHash<int, QImage>>(this);
+	connect(m_game_icon_watcher, &QFutureWatcher<QHash<int, QImage>>::finished, this, [this]
+	{
+		const QHash<int, QImage> icons = m_game_icon_watcher->result();
+		for (auto it = icons.cbegin(); it != icons.cend(); ++it)
+			if (it.key() >= 0 && it.key() < m_games.size() && m_games[it.key()]->icon.isNull() && !it.value().isNull())
+				m_games[it.key()]->icon = QPixmap::fromImage(it.value());
+		update();
+	});
+	load_missing_game_icons();
 	m_visual_focus = static_cast<float>(current_focus());
 	m_target_column = m_column;
 	m_target_focus = current_focus();
@@ -559,7 +651,7 @@ void xmb_mode_dialog::set_background_mode(int mode)
 
 void xmb_mode_dialog::set_theme_month(int month)
 {
-	m_theme_month = std::clamp(month, -1, 11);
+	m_theme_month = std::clamp(month, -1, 12);
 	QSettings().setValue(QStringLiteral("armsxpc/xmb/themeMonth"), m_theme_month);
 	update();
 }
@@ -626,7 +718,7 @@ void xmb_mode_dialog::update_game_version_labels()
 	}
 	if (m_items.size() > 1)
 		for (item& group : m_items[1])
-			if (group.key == QStringLiteral("settings.armsx3"))
+			if (group.key == QStringLiteral("settings.xmb"))
 				for (item& setting : group.children)
 				{
 					if (setting.key == QStringLiteral("armsx3.gameRegion")) setting.subtitle = m_show_game_region ? tr("On") : tr("Off");
@@ -693,6 +785,24 @@ void xmb_mode_dialog::load_game_backdrop()
 		QImage image;
 		image.loadFromData(data, "PNG");
 		return image;
+	}));
+}
+
+void xmb_mode_dialog::load_missing_game_icons()
+{
+	QVector<QPair<int, game_info>> missing;
+	for (int i = 0; i < m_games.size(); ++i)
+		if (m_games[i]->icon.isNull()) missing.push_back({i, m_games[i]});
+	if (missing.isEmpty()) return;
+	m_game_icon_watcher->setFuture(QtConcurrent::run([missing = std::move(missing)]()
+	{
+		QHash<int, QImage> icons;
+		for (const auto& entry : missing)
+		{
+			const QImage image = load_game_icon_image(entry.second);
+			if (!image.isNull()) icons.insert(entry.first, image);
+		}
+		return icons;
 	}));
 }
 
@@ -824,7 +934,11 @@ void xmb_mode_dialog::paintEvent(QPaintEvent*)
 		if (!backdrop.isNull()) draw_cover(p, QRectF(0, 0, w, h), backdrop.toImage());
 		else fill_original_background(p, w, h, m_theme_month);
 	}
-	else fill_original_background(p, w, h, m_theme_month);
+	else
+	{
+		fill_original_background(p, w, h, m_theme_month);
+		if (m_background_mode == 1) fill_simple_wave(p, w, h, QDateTime::currentMSecsSinceEpoch() / 1000.0, m_theme_month);
+	}
 	if (m_game_background.isNull() && m_p3t_slides.size() > 1 && m_p3t_slide_clock.isValid())
 	{
 		const int next = (current + 1) % m_p3t_slides.size();
@@ -904,6 +1018,7 @@ void xmb_mode_dialog::paintEvent(QPaintEvent*)
 				p.setOpacity(alpha * near);
 				p.drawImage(icon_rect, node.image);
 			}
+			else if (node.game >= 0 && !m_default_game_icon.isNull()) p.drawImage(icon_rect, m_default_game_icon);
 			else if (node.icon == QStringLiteral("ARMSX3_MARK")) draw_armsx3_mark(p, icon_rect, false);
 			if (selected || node.game < 0)
 			{
@@ -988,6 +1103,8 @@ void xmb_mode_dialog::paintEvent(QPaintEvent*)
 			p.drawImage(icon_rect, node.image);
 			p.setOpacity(alpha);
 		}
+		else if (!sublist && node.game >= 0 && !m_default_game_icon.isNull())
+			p.drawImage(QRectF(icon_x, icon_y, icon_w, icon_h), m_default_game_icon);
 		else if (node.icon == QStringLiteral("ARMSX3_MARK"))
 			draw_armsx3_mark(p, QRectF(icon_x, icon_y, icon_w, icon_h), false);
 		// Firmware-backed XMB artwork is the only icon source; do not substitute text glyphs.

@@ -6,6 +6,7 @@
 #include <QColor>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QHash>
 #include <QStringList>
 #include <QVector>
 
@@ -66,6 +67,7 @@ private:
 	QVector<QImage> m_category_images;
 	QVector<QImage> m_firmware_category_images;
 	QHash<QString, QImage> m_firmware_item_images;
+	QImage m_default_game_icon;
 	std::unique_ptr<xmb_firmware> m_firmware;
 	std::unique_ptr<xmb_wave_model> m_wave_model;
 	xmb_wave_widget* m_wave_widget = nullptr;
@@ -110,6 +112,7 @@ private:
 	QTimer* m_animation = nullptr;
 	QTimer* m_game_backdrop_delay = nullptr;
 	QFutureWatcher<QImage>* m_game_backdrop_watcher = nullptr;
+	QFutureWatcher<QHash<int, QImage>>* m_game_icon_watcher = nullptr;
 	QString m_game_backdrop_key;
 	QString m_game_backdrop_loading_key;
 	game_info m_game_backdrop_pending;
@@ -122,5 +125,6 @@ private:
 	QString game_subtitle(int index) const;
 	void refresh_game_backdrop();
 	void load_game_backdrop();
+	void load_missing_game_icons();
 	void launch_selected();
 };
