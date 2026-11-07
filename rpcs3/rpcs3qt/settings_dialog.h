@@ -21,9 +21,10 @@ class settings_dialog : public QDialog
 	Q_OBJECT
 
 public:
-	explicit settings_dialog(std::shared_ptr<gui_settings> gui_settings, std::shared_ptr<emu_settings> emu_settings, int tab_index = 0, QWidget* parent = nullptr, const GameInfo* game = nullptr, bool create_cfg_from_global_cfg = true, const std::string& db_config = "");
+	explicit settings_dialog(std::shared_ptr<gui_settings> gui_settings, std::shared_ptr<emu_settings> emu_settings, int tab_index = 0, QWidget* parent = nullptr, const GameInfo* game = nullptr, bool create_cfg_from_global_cfg = true, const std::string& db_config = "", bool show_debug_tab = false);
 	~settings_dialog();
 	void open() override;
+	void set_xmb_mode();
 Q_SIGNALS:
 	void GuiStylesheetRequest();
 	void GuiRepaintRequest();

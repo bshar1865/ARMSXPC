@@ -6,6 +6,7 @@
 #include <QList>
 #include <QUrl>
 #include <QMimeData>
+#include <QStringList>
 
 #include "update_manager.h"
 #include "settings.h"
@@ -25,6 +26,9 @@ class persistent_settings;
 class kernel_explorer;
 class system_cmd_dialog;
 class gui_pad_thread;
+class QAudioBufferOutput;
+class QAudioOutput;
+class QMediaPlayer;
 
 struct gui_game_info;
 
@@ -209,4 +213,16 @@ private:
 	bool m_with_cli_boot = false;
 	bool m_shown = false;
 	bool m_xmb_mode_open = false;
+	bool m_xmb_frontend_enabled = false;
+	bool m_xmb_refresh_pending = false;
+	QMediaPlayer* m_xmb_music_player = nullptr;
+	QAudioOutput* m_xmb_music_output = nullptr;
+	QAudioBufferOutput* m_xmb_music_buffer = nullptr;
+	QMediaPlayer* m_xmb_pause_music_player = nullptr;
+	QAudioOutput* m_xmb_pause_music_output = nullptr;
+	QStringList m_xmb_music_queue;
+	int m_xmb_music_index = -1;
+	quint64 m_xmb_music_generation = 0;
+	bool m_xmb_exit_confirmed = false;
+	bool m_xmb_exit_requested = false;
 };

@@ -23,10 +23,13 @@
 #include <QFile>
 #include <QImageReader>
 #include <QRandomGenerator>
+#include <QCryptographicHash>
 #include <QSet>
 #include <QStandardPaths>
 #include <QFutureWatcher>
 #include <QAudioOutput>
+#include <QAudioBuffer>
+#include <QAudioBufferOutput>
 #include <QMediaPlayer>
 #include <QSoundEffect>
 #include <cstdint>
@@ -44,6 +47,7 @@ extern "C"
 	std::int64_t _armsx3_xmbPamFrame(std::int64_t handle, std::uint8_t* dst, std::int64_t capacity);
 	void _armsx3_xmbPamClose(std::int64_t handle);
 	bool _armsx3_xmbDecodeAudio(std::string_view input, std::string_view output);
+	bool _armsx3_xmbExtractCoverArt(std::string_view input, std::string_view output);
 	bool _armsx3_xmbDecodePamAudio(std::string_view input, std::string_view output);
 }
 
@@ -87,6 +91,28 @@ namespace
 		QImage image;
 		image.loadFromData(data, "PNG");
 		return image;
+	}
+
+	QImage load_music_cover_image(const QString& path)
+	{
+		const QString cache_dir = QString::fromStdString(fs::get_cache_dir()) + QStringLiteral("xmb_media/");
+		QDir().mkpath(cache_dir);
+		const QString cache_path = cache_dir + QStringLiteral("music-cover-") +
+			QString::fromLatin1(QCryptographicHash::hash(path.toUtf8(), QCryptographicHash::Sha256).toHex()) + QStringLiteral(".img");
+		QImage image(cache_path);
+		if (image.isNull())
+		{
+			QFile::remove(cache_path);
+			const QByteArray input = path.toUtf8(), output = cache_path.toUtf8();
+			if (!_armsx3_xmbExtractCoverArt(std::string_view(input.constData(), static_cast<size_t>(input.size())),
+				std::string_view(output.constData(), static_cast<size_t>(output.size())))) return {};
+			image.load(cache_path);
+		}
+		if (image.isNull()) return {};
+		// PS3 music items use square album icons. Center-crop landscape artwork to that same shape.
+		const int side = std::min(image.width(), image.height());
+		const QRect crop((image.width() - side) / 2, (image.height() - side) / 2, side, side);
+		return image.copy(crop).scaled(256, 256, Qt::KeepAspectRatio, Qt::SmoothTransformation);
 	}
 
 	QString materialize_game_content(const game_info& game, game_content_type type, const QString& extension)
@@ -317,14 +343,14 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	setWindowTitle(tr("ARMSXPC XMB"));
 	setMinimumSize(900, 506);
 	setWindowState(windowState() | Qt::WindowMaximized);
+	setWindowFlag(Qt::FramelessWindowHint, true);
 	if (m_in_game)
 	{
-		setWindowFlag(Qt::FramelessWindowHint, true);
 		setAttribute(Qt::WA_TranslucentBackground, true);
 		setAutoFillBackground(false);
 	}
 	setFocusPolicy(Qt::StrongFocus);
-	m_categories = { tr("Users"), tr("Settings"), tr("Photo"), tr("Music"), tr("Game"), tr("Tools"), tr("Network"), tr("ARMSX3"), tr("RPCN") };
+	m_categories = { tr("Users"), tr("Settings"), tr("Photo"), tr("Music"), tr("Video"), tr("Tools"), tr("Game"), tr("Network"), tr("ARMSX3"), tr("RPCN") };
 	m_focus.fill(0, m_categories.size());
 	m_focus[0] = 1;
 	QSettings preferences;
@@ -346,7 +372,9 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		}
 		else { m_p3t_theme_path.clear(); preferences.remove(QStringLiteral("p3tTheme")); }
 	}
-	m_background_mode = std::clamp(preferences.value(QStringLiteral("backgroundMode"), 0).toInt(), 0, 2);
+	// The firmware wave is the one desktop default. Keep a custom still background when one
+	// was explicitly chosen, but ignore the retired gradient/simple-wave selector preference.
+	m_background_mode = m_custom_background.isEmpty() ? 0 : 2;
 	m_theme_month = std::clamp(preferences.value(QStringLiteral("themeMonth"), -1).toInt(), -1, 12);
 	if (preferences.value(QStringLiteral("themeMonth"), -1).toInt() < 0) m_theme_month = -1;
 	m_accent_color = preferences.value(QStringLiteral("accent"), QColor(255, 255, 255)).value<QColor>();
@@ -355,8 +383,17 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	m_show_game_region = preferences.value(QStringLiteral("showGameRegion"), false).toBool();
 	m_show_game_backgrounds = preferences.value(QStringLiteral("showGameBackgrounds"), true).toBool();
 	m_show_animated_game_icons = preferences.value(QStringLiteral("showAnimatedGameIcons"), true).toBool();
-	m_column = std::clamp(preferences.value(QStringLiteral("column"), 5).toInt(), 0, static_cast<int>(m_categories.size()) - 1);
-	for (int i = 0; i < m_focus.size(); ++i) m_focus[i] = std::max(0, preferences.value(QStringLiteral("focus/%1").arg(i), m_focus[i]).toInt());
+	const int stored_column = preferences.value(QStringLiteral("column"), 6).toInt();
+	const bool video_column_index = preferences.value(QStringLiteral("videoColumnIndex"), false).toBool();
+	const bool migrate_column_indices = !video_column_index && preferences.contains(QStringLiteral("column"));
+	m_column = std::clamp(migrate_column_indices && stored_column >= 5 ? stored_column + 1 : stored_column, 0, static_cast<int>(m_categories.size()) - 1);
+	preferences.setValue(QStringLiteral("videoColumnIndex"), true);
+	for (int i = 0; i < m_focus.size(); ++i)
+	{
+		if (migrate_column_indices && i == 4) continue; // New Video column, leave at its first item.
+		const int old_index = migrate_column_indices && i >= 5 ? i - 1 : i;
+		m_focus[i] = std::max(0, preferences.value(QStringLiteral("focus/%1").arg(old_index), m_focus[i]).toInt());
+	}
 	m_visual_column = static_cast<float>(m_column);
 	m_firmware = std::make_unique<xmb_firmware>(QString::fromStdString(g_cfg_vfs.get_dev_flash()));
 	load_menu_sounds();
@@ -365,17 +402,18 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	m_wave_widget = new xmb_wave_widget(*m_wave_model, *m_firmware, this);
 	m_wave_widget->setGeometry(rect());
 	m_wave_widget->show();
-	m_wave_widget->setVisible(!m_in_game && m_p3t_background.isNull() && m_background_mode != 1);
+	m_wave_widget->setVisible(!m_in_game && m_p3t_background.isNull());
 	const auto fw = [this](const QString& rco, const QString& key, const QString& fallback) { const QString text = m_firmware->text(rco, key); return text.isEmpty() ? fallback : text; };
 	m_categories = { fw("xmb_ingame", "msg_user", tr("Users")), fw("xmb_ingame", "msg_setting", tr("Settings")),
 		fw("xmb_ingame", "msg_photo", tr("Photo")), fw("xmb_ingame", "msg_music", tr("Music")),
-		tr("Tools"), fw("xmb_ingame", "msg_game", tr("Game")), fw("xmb_ingame", "msg_net", tr("Network")),
+		fw("xmb_ingame", "msg_video", tr("Video")), tr("Tools"), fw("xmb_ingame", "msg_game", tr("Game")), fw("xmb_ingame", "msg_net", tr("Network")),
 		QStringLiteral("ARMSX3"), fw("xmb_ingame", "msg_friend", tr("RPCN")) };
+	m_focus.resize(m_categories.size());
 	m_category_images = {
 		m_firmware->image("xmb_ingame", "tex_user"), m_firmware->image("xmb_ingame", "tex_sysconf"),
 		m_firmware->image("xmb_ingame", "tex_photo"), m_firmware->image("xmb_ingame", "tex_music"),
-		m_firmware->image("explore_category_game", "item_tex_ps3util"), m_firmware->image("xmb_ingame", "tex_game"),
-		m_firmware->image("xmb_ingame", "tex_network"), {}, m_firmware->image("xmb_ingame", "tex_friend") };
+		m_firmware->image("xmb_ingame", "tex_video"), m_firmware->image("explore_category_game", "item_tex_ps3util"),
+		m_firmware->image("xmb_ingame", "tex_game"), m_firmware->image("xmb_ingame", "tex_network"), {}, m_firmware->image("xmb_ingame", "tex_friend") };
 	m_firmware_category_images = m_category_images;
 	for (const game_info& game : games)
 		if (game && game->bootable) m_games.push_back(game);
@@ -404,7 +442,38 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 			leaf("core.system", tr("System"), QString::fromUtf8("▤"), "settings.4"), leaf("core.network", tr("Network"), QString::fromUtf8("◎"), "settings.5"),
 			leaf("core.advanced", tr("Advanced"), QString::fromUtf8("⚙"), "settings.6"), leaf("core.emulator", tr("Emulator"), QString::fromUtf8("⚙"), "settings.7"),
 			leaf("core.gui", tr("Interface"), QString::fromUtf8("◐"), "settings.8")}),
-		folder("settings.music", tr("Music Settings"), QString::fromUtf8("♫"), {leaf("settings.music.open", tr("Open Music Player"), QString::fromUtf8("♫"), "music"), leaf("settings.music.audio", tr("Audio Settings"), QString::fromUtf8("♫"), "settings.2")}),
+		folder("settings.music", tr("Music Settings"), QString::fromUtf8("♫"), {
+			leaf("settings.music.game", tr("Game Music Previews (SND0.AT3)"), QString::fromUtf8("♫"), "music.setting.game",
+				QSettings().value(QStringLiteral("armsxpc/xmb/gameMusic"), true).toBool() ? tr("On") : tr("Off")),
+			leaf("settings.music.library", tr("XMB Library Background Music"), QString::fromUtf8("♫"), "music.setting.library",
+				QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusic"), false).toBool() ? tr("On") : tr("Off")),
+			leaf("settings.music.library.volume.down", tr("Library Music Volume −"), QString::fromUtf8("♫"), "music.setting.library.volume.down",
+				QStringLiteral("%1%").arg(QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicVolume"), 15).toInt())),
+			leaf("settings.music.library.volume.up", tr("Library Music Volume +"), QString::fromUtf8("♫"), "music.setting.library.volume.up"),
+			leaf("settings.music.library.select", tr("Choose Library Background Track"), QString::fromUtf8("♫"), "music.setting.library.select",
+				QFileInfo(QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicTrack")).toString()).fileName()),
+			leaf("settings.music.library.reset", tr("Use Music Folder Playlist"), QString::fromUtf8("♫"), "music.setting.library.reset"),
+			leaf("settings.music.sfx", tr("Firmware Menu Sounds"), QString::fromUtf8("♫"), "music.setting.sfx",
+				QSettings().value(QStringLiteral("armsxpc/xmb/menuSounds"), true).toBool() ? tr("On") : tr("Off")),
+			leaf("settings.music.sfx.pack", tr("Import Menu Sound Pack"), QString::fromUtf8("♫"), "music.setting.sfx.pack",
+				QFileInfo(QSettings().value(QStringLiteral("armsxpc/xmb/menuSfxFolder")).toString()).isDir() ? tr("Custom sound pack installed") : tr("Use firmware sounds")),
+			leaf("settings.music.sfx.reset", tr("Remove Custom Menu Sound Pack"), QString::fromUtf8("♫"), "music.setting.sfx.reset"),
+			leaf("settings.music.sfx.volume.down", tr("Menu Sound Volume −"), QString::fromUtf8("♫"), "music.setting.sfx.volume.down",
+				QStringLiteral("%1%").arg(QSettings().value(QStringLiteral("armsxpc/xmb/menuSoundVolume"), 55).toInt())),
+			leaf("settings.music.sfx.volume.up", tr("Menu Sound Volume +"), QString::fromUtf8("♫"), "music.setting.sfx.volume.up"),
+			leaf("settings.music.pause", tr("In-Game Pause Menu Music"), QString::fromUtf8("♫"), "music.setting.pause",
+				QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusic"), false).toBool() ? tr("On") : tr("Off")),
+			leaf("settings.music.pause.volume.down", tr("Pause Music Volume −"), QString::fromUtf8("♫"), "music.setting.pause.volume.down",
+				QStringLiteral("%1%").arg(QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusicVolume"), 15).toInt())),
+			leaf("settings.music.pause.volume.up", tr("Pause Music Volume +"), QString::fromUtf8("♫"), "music.setting.pause.volume.up"),
+			leaf("settings.music.pause.select", tr("Choose Pause Menu Music Track"), QString::fromUtf8("♫"), "music.setting.pause.select",
+				QFileInfo(QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusicTrack")).toString()).fileName()),
+			leaf("settings.music.trophy.select", tr("Choose Trophy Sound"), QString::fromUtf8("♫"), "music.setting.trophy.select",
+				QFileInfo(QString::fromStdString(fs::get_config_dir()) + QStringLiteral("sounds/snd_trophy.wav")).exists() ? tr("Custom sound installed") : tr("No sound installed")),
+			leaf("settings.music.trophy.test", tr("Test Trophy Sound"), QString::fromUtf8("♫"), "music.setting.trophy.test"),
+			leaf("settings.music.trophy.clear", tr("Remove Custom Trophy Sound"), QString::fromUtf8("♫"), "music.setting.trophy.clear"),
+			leaf("settings.music.open", tr("Open Music Player"), QString::fromUtf8("♫"), "music"),
+			leaf("settings.music.audio", tr("Audio Settings"), QString::fromUtf8("♫"), "settings.2")}),
 		folder("settings.system", tr("System Settings"), QString::fromUtf8("▤"), {leaf("settings.system.general", tr("General Settings"), QString::fromUtf8("▤"), "settings.4"), leaf("settings.system.user", tr("Manage Users"), QString::fromUtf8("♟"), "users")}),
 		folder("settings.theme", tr("Theme Settings"), QString::fromUtf8("◐"), {leaf("settings.theme.gui", tr("Interface and Theme"), QString::fromUtf8("◐"), "settings.8")}),
 		folder("settings.accessory", tr("Accessory Settings"), QString::fromUtf8("⌘"), {leaf("settings.accessory.pad", tr("Controller Settings"), QString::fromUtf8("⌘"), "padsettings"), leaf("settings.accessory.io", tr("Input / Output Settings"), QString::fromUtf8("⌘"), "settings.3")}),
@@ -415,32 +484,35 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	for (item& node : m_items[1])
 		if (node.key == "settings.theme")
 		{
+			item firmware_theme = folder("settings.theme.select", tr("Theme"), QString::fromUtf8("\u25c8"), {
+				leaf("settings.theme.select.original", tr("Original Firmware Theme"), QString::fromUtf8("\u25c8"), "xmb.theme.select:original",
+				m_p3t_theme_path.isEmpty() && m_custom_background.isEmpty() ? tr("Selected") : QString())
+			}, m_p3t_theme_name.isEmpty() ? tr("Original Firmware Theme") : m_p3t_theme_name);
 			node.children = {
-				leaf("settings.theme.select.original", tr("Original Firmware Wave"), QString::fromUtf8("\u25c8"), "xmb.theme.select:original",
-				m_p3t_theme_path.isEmpty() && m_custom_background.isEmpty() && m_background_mode == 0 ? tr("Selected") : QString()),
-				leaf("settings.theme.background", tr("Choose XMB Background"), QString::fromUtf8("\u25a7"), "xmb.background"),
-				leaf("settings.theme.p3t", tr("Import PS3 Theme (.p3t)"), QString::fromUtf8("\u25c8"), "xmb.theme.import"),
-				leaf("settings.theme.backgroundMode", tr("XMB Background Style"), QString::fromUtf8("\u25c8"), "xmb.background.mode"),
-				leaf("settings.theme.color", tr("XMB Color"), QString::fromUtf8("\u25ce"), "xmb.color"),
-				leaf("settings.theme.reset", tr("Restore ARMSX3 Background"), QString::fromUtf8("\u21ba"), "xmb.background.reset"),
+				std::move(firmware_theme),
+				leaf("settings.theme.background", tr("Background"), QString::fromUtf8("\u25a7"), "xmb.background"),
+				leaf("settings.theme.p3t", tr("Import Theme (.p3t)"), QString::fromUtf8("\u25c8"), "xmb.theme.import"),
+				leaf("settings.theme.color", tr("Theme Color"), QString::fromUtf8("\u25ce"), "xmb.color"),
+				leaf("settings.theme.reset", tr("Restore Original Theme"), QString::fromUtf8("\u21ba"), "xmb.background.reset"),
 				leaf("settings.theme.accent", tr("XMB Accent Color"), QString::fromUtf8("\u25ce"), "xmb.accent"),
 				leaf("settings.theme.gameBackgrounds", tr("Show Game Backgrounds (PIC1)"), QString::fromUtf8("\u25a7"), "xmb.gameBackgrounds",
 				m_show_game_backgrounds ? tr("On") : tr("Off")),
 				leaf("settings.theme.animatedIcons", tr("Animated Game Icons (ICON1.PAM)"), QString::fromUtf8("\u25c9"), "xmb.animatedIcons",
 				m_show_animated_game_icons ? tr("On") : tr("Off")),
-				leaf("settings.theme.clock", tr("Show / Hide Clock"), QString::fromUtf8("\u25f7"), "xmb.clock"),
-				leaf("settings.theme.gui", tr("RPCS3 Interface Settings"), QString::fromUtf8("\u2699"), "settings.8")
+				leaf("settings.theme.clock", tr("Show / Hide Clock"), QString::fromUtf8("\u25f7"), "xmb.clock")
 			};
 			const QString themes_dir = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/themes/");
 			QDir().mkpath(themes_dir);
 			const QString active_theme = QFileInfo(m_p3t_theme_path).canonicalFilePath();
-			const QFileInfoList themes = QDir(themes_dir).entryInfoList({QStringLiteral("*.p3t")}, QDir::Files, QDir::Name);
+			QFileInfoList themes = QDir(themes_dir).entryInfoList({QStringLiteral("*.p3t")}, QDir::Files, QDir::Name);
+			if (!active_theme.isEmpty() && QFileInfo::exists(active_theme) && std::none_of(themes.cbegin(), themes.cend(), [&](const QFileInfo& info) { return info.canonicalFilePath() == active_theme; }))
+				themes.push_front(QFileInfo(active_theme));
 			for (const QFileInfo& theme : themes)
 			{
 				const QString path = theme.absoluteFilePath();
 				const QString token = QString::fromLatin1(QUrl::toPercentEncoding(path));
 				const QString status = QFileInfo(path).canonicalFilePath() == active_theme ? tr("Selected") : QString();
-				node.children.insert(node.children.begin() + static_cast<std::ptrdiff_t>(node.children.size() - 1),
+				node.children.front().children.push_back(
 					leaf(QStringLiteral("settings.theme.select.%1").arg(token), theme.completeBaseName(), QString::fromUtf8("\u25c8"), QStringLiteral("xmb.theme.select:") + token, status));
 			}
 		}
@@ -455,6 +527,29 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		leaf("armsx3.gameVersion", tr("Show Game Update Version"), QString::fromUtf8("\u25ce"), "xmb.gameVersion",
 			m_show_game_version ? tr("On") : tr("Off"))
 	}));
+	const auto folder_setting = [&preferences](const QString& key)
+	{
+		const QString path = preferences.value(key).toString();
+		return path.isEmpty() ? QObject::tr("Use default folder") : path;
+	};
+	m_items[1].push_back(folder("settings.rpcs3", tr("RPCS3 Settings"), QString::fromUtf8("\u2699"), {
+		leaf("settings.rpcs3.cpu", tr("CPU Settings"), QString::fromUtf8("\u2699"), "settings.0"),
+		leaf("settings.rpcs3.gpu", tr("GPU Settings"), QString::fromUtf8("\u25a3"), "settings.1"),
+		leaf("settings.rpcs3.audio", tr("Audio Settings"), QString::fromUtf8("\u266b"), "settings.2"),
+		leaf("settings.rpcs3.io", tr("Input / Output Settings"), QString::fromUtf8("\u2318"), "settings.3"),
+		leaf("settings.rpcs3.system", tr("System Settings"), QString::fromUtf8("\u25a4"), "settings.4"),
+		leaf("settings.rpcs3.network", tr("Network Settings"), QString::fromUtf8("\u25ce"), "settings.5"),
+		leaf("settings.rpcs3.advanced", tr("Advanced Settings"), QString::fromUtf8("\u2699"), "settings.6"),
+		leaf("settings.rpcs3.emulator", tr("Emulator Settings"), QString::fromUtf8("\u2699"), "settings.7"),
+		leaf("settings.rpcs3.interface", tr("Interface Settings"), QString::fromUtf8("\u25d0"), "settings.8"),
+		leaf("settings.rpcs3.debug", tr("Debug Settings"), QString::fromUtf8("\u2699"), "settings.9"),
+		leaf("settings.rpcs3.controller", tr("Controller Settings"), QString::fromUtf8("\u2318"), "padsettings"),
+		leaf("settings.rpcs3.rpcn", tr("RPCN Account"), QString::fromUtf8("\u2659"), "rpcn"),
+		leaf("settings.rpcs3.games", tr("Game Folder"), QString::fromUtf8("\u25b6"), "xmb.folder.games", folder_setting(QStringLiteral("gameFolder"))),
+		leaf("settings.rpcs3.music", tr("Music Folder"), QString::fromUtf8("\u266b"), "xmb.folder.music", folder_setting(QStringLiteral("musicFolder"))),
+		leaf("settings.rpcs3.videos", tr("Video Folder"), QString::fromUtf8("\u25b6"), "xmb.folder.videos", folder_setting(QStringLiteral("videoFolder"))),
+		leaf("settings.rpcs3.pictures", tr("Picture Folder"), QString::fromUtf8("\u25a7"), "xmb.folder.pictures", folder_setting(QStringLiteral("pictureFolder")))
+	}));
 	m_items[2] = { folder("photo.screenshots", tr("Screenshots"), QString::fromUtf8("▧"), {leaf("photo.open", tr("Open Screenshot Manager"), QString::fromUtf8("▧"), "screenshots")}),
 		leaf("photo.empty", tr("There are no images."), QString::fromUtf8("▧"), "") };
 	{
@@ -464,6 +559,8 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		// cover the equivalent user-visible folders as well as RPCS3's screenshots and PS3 photo
 		// storage. Canonical-path deduplication below prevents overlapping roots being listed twice.
 		QStringList roots{QString::fromStdString(fs::get_config_dir() + "screenshots/"), QString::fromStdString(rpcs3::utils::get_hdd0_dir() + "/photo/")};
+		const QString configured_picture_root = preferences.value(QStringLiteral("pictureFolder")).toString();
+		if (!configured_picture_root.isEmpty()) roots.push_back(configured_picture_root);
 		for (const QStandardPaths::StandardLocation location : {QStandardPaths::PicturesLocation, QStandardPaths::MoviesLocation, QStandardPaths::DownloadLocation})
 		{
 			const QString root = QStandardPaths::writableLocation(location);
@@ -552,8 +649,21 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		QDir().mkpath(music_root);
 		const QStringList audio_patterns{QStringLiteral("*.mp3"), QStringLiteral("*.ogg"), QStringLiteral("*.wav"), QStringLiteral("*.flac"), QStringLiteral("*.m4a"), QStringLiteral("*.aac"), QStringLiteral("*.opus")};
 		QStringList tracks;
-		QDirIterator it(music_root, audio_patterns, QDir::Files);
-		while (it.hasNext()) tracks.push_back(it.next());
+		QSet<QString> seen_tracks;
+		QStringList music_roots{music_root};
+		const QString configured_music_root = preferences.value(QStringLiteral("musicFolder")).toString();
+		if (!configured_music_root.isEmpty()) music_roots.push_back(configured_music_root);
+		for (const QString& root : music_roots)
+		{
+			QDirIterator it(root, audio_patterns, QDir::Files, QDirIterator::Subdirectories);
+			while (it.hasNext())
+			{
+				const QString path = it.next();
+				const QString canonical = QFileInfo(path).canonicalFilePath();
+				const QString identity = canonical.isEmpty() ? QFileInfo(path).absoluteFilePath() : canonical;
+				if (!seen_tracks.contains(identity)) { seen_tracks.insert(identity); tracks.push_back(path); }
+			}
+		}
 		std::sort(tracks.begin(), tracks.end(), [](const QString& a, const QString& b) { return QFileInfo(a).fileName().compare(QFileInfo(b).fileName(), Qt::CaseInsensitive) < 0; });
 		QVariantMap saved_playlists = preferences.value(QStringLiteral("musicPlaylists")).toMap();
 		std::vector<item> playlist_items;
@@ -594,7 +704,63 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 			folder("music.library", tr("Music Library"), QString::fromUtf8("\u266b"), std::move(track_items))
 		};
 	}
-	m_items[4] = { folder("game.packages", tr("Package Manager"), QString::fromUtf8("▣"), {leaf("game.pkg", tr("Install Package"), QString::fromUtf8("▣"), "packages")}),
+	{
+		std::vector<item> video_items{leaf("video.import", tr("Import Videos"), QString::fromUtf8("+"), "video.import")};
+		const QString video_root = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/videos/");
+		QDir().mkpath(video_root);
+		QStringList roots{video_root, QStandardPaths::writableLocation(QStandardPaths::MoviesLocation)};
+		const QString configured_video_root = preferences.value(QStringLiteral("videoFolder")).toString();
+		if (!configured_video_root.isEmpty()) roots.push_back(configured_video_root);
+		const QStringList extensions{QStringLiteral("avi"), QStringLiteral("mkv"), QStringLiteral("mp4"), QStringLiteral("m4v"), QStringLiteral("mov"), QStringLiteral("mpeg"), QStringLiteral("mpg"), QStringLiteral("wmv"), QStringLiteral("webm"), QStringLiteral("m2ts"), QStringLiteral("mts"), QStringLiteral("vob")};
+		QSet<QString> seen;
+		QVector<QPair<QString, QString>> videos;
+		for (const QString& root : roots)
+		{
+			if (root.isEmpty()) continue;
+			QDirIterator it(root, QDir::Files, QDirIterator::Subdirectories);
+			while (it.hasNext())
+			{
+				const QString path = it.next();
+				const QFileInfo info(path);
+				if (!extensions.contains(info.suffix(), Qt::CaseInsensitive)) continue;
+				const QString canonical = info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
+				if (seen.contains(canonical)) continue;
+				seen.insert(canonical);
+				videos.push_back({info.completeBaseName(), path});
+			}
+		}
+		std::sort(videos.begin(), videos.end(), [](const auto& a, const auto& b) { return a.first.compare(b.first, Qt::CaseInsensitive) < 0; });
+		QVariantMap saved_playlists = preferences.value(QStringLiteral("videoPlaylists")).toMap();
+		std::vector<item> playlist_items{leaf("video.playlists.create", tr("Create Playlist"), QString::fromUtf8("+"), "video.playlist.create")};
+		for (auto playlist = saved_playlists.cbegin(); playlist != saved_playlists.cend(); ++playlist)
+		{
+			const QString name_token = QString::fromLatin1(QUrl::toPercentEncoding(playlist.key()));
+			const QStringList paths = playlist.value().toStringList();
+			std::vector<item> entries{
+				leaf(QStringLiteral("video.playlist.start.%1").arg(name_token), tr("Play All"), QString::fromUtf8("▶"), QStringLiteral("video.playlist.start:") + name_token),
+				leaf(QStringLiteral("video.playlist.clear.%1").arg(name_token), tr("Clear Playlist"), QString::fromUtf8("↺"), QStringLiteral("video.playlist.clear:") + name_token),
+				leaf(QStringLiteral("video.playlist.delete.%1").arg(name_token), tr("Delete Playlist"), QString::fromUtf8("×"), QStringLiteral("video.playlist.delete:") + name_token)
+			};
+			for (qsizetype i = 0; i < paths.size(); ++i)
+				if (QFileInfo::exists(paths[i])) entries.push_back(folder(QStringLiteral("video.playlist.track.%1.%2").arg(name_token).arg(i), QFileInfo(paths[i]).completeBaseName(), QString::fromUtf8("▶"), {
+					leaf(QStringLiteral("video.playlist.track.play.%1.%2").arg(name_token).arg(i), tr("Play"), QString::fromUtf8("▶"), QStringLiteral("video.play:") + paths[i]),
+					leaf(QStringLiteral("video.playlist.track.remove.%1.%2").arg(name_token).arg(i), tr("Remove from Playlist"), QString::fromUtf8("×"), QStringLiteral("video.playlist.remove:%1:%2").arg(name_token, QString::fromLatin1(QUrl::toPercentEncoding(paths[i]))))
+				}));
+			playlist_items.push_back(folder(QStringLiteral("video.playlist.%1").arg(name_token), playlist.key(), QString::fromUtf8("▶"), std::move(entries), tr("%1 videos").arg(paths.size())));
+		}
+		video_items.push_back(folder("video.playlists", tr("Playlists"), QString::fromUtf8("▶"), std::move(playlist_items)));
+		for (qsizetype i = 0; i < videos.size(); ++i)
+		{
+			const QString path = videos[i].second;
+			video_items.push_back(folder(QStringLiteral("video.%1").arg(i), videos[i].first, QString::fromUtf8("▶"), {
+				leaf(QStringLiteral("video.play.%1").arg(i), tr("Play"), QString::fromUtf8("▶"), QStringLiteral("video.play:") + path),
+				leaf(QStringLiteral("video.add.%1").arg(i), tr("Add to Playlist"), QString::fromUtf8("+"), QStringLiteral("video.playlist.add:") + QString::fromLatin1(QUrl::toPercentEncoding(path)))
+			}, QFileInfo(path).fileName()));
+		}
+		if (videos.isEmpty()) video_items.push_back(leaf("video.empty", tr("No videos in the library"), QString::fromUtf8("▶"), ""));
+		m_items[4] = std::move(video_items);
+	}
+	m_items[5] = { folder("game.packages", tr("Package Manager"), QString::fromUtf8("▣"), {leaf("game.pkg", tr("Install Package"), QString::fromUtf8("▣"), "packages")}),
 		leaf("game.launch", tr("Launch Game"), QString::fromUtf8("▶"), "boot.file"),
 		leaf("game.vsh", tr("PlayStation 3 System"), QString::fromUtf8("▶"), "boot.vsh"),
 		leaf("game.trophies", tr("Trophy Collection"), QString::fromUtf8("🏆"), "trophies"),
@@ -604,7 +770,10 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 	{
 		item game; game.key = QString::fromStdString(m_games[i]->serial); game.title = QString::fromStdString(m_games[i]->name.empty() ? m_games[i]->serial : m_games[i]->name);
 		game.subtitle = game_subtitle(i); game.icon = QStringLiteral("🎮"); game.game = i;
-		m_items[5].push_back(std::move(game));
+		const std::array<QString, 8> setting_pages{tr("CPU"), tr("GPU"), tr("Audio"), tr("Input / Output"), tr("System"), tr("Network"), tr("Advanced"), tr("Emulator")};
+		for (int tab = 0; tab < static_cast<int>(setting_pages.size()); ++tab)
+			game.children.push_back(leaf(QStringLiteral("game.config.%1.%2").arg(i).arg(tab), setting_pages[tab], QString::fromUtf8("\u2699"), QStringLiteral("game.config.%1.%2").arg(i).arg(tab)));
+		m_items[6].push_back(std::move(game));
 	}
 	if (m_in_game)
 	{
@@ -613,7 +782,7 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		if (m_running_game)
 			for (int i = 0; i < m_games.size(); ++i)
 				if (m_games[i] && m_games[i]->serial == m_running_game->serial) { running_game.game = i; break; }
-		m_items[5] = {
+		m_items[6] = {
 			std::move(running_game),
 			leaf("ingame.restart", tr("Restart Game"), QString::fromUtf8("\u21bb"), "game.restart"),
 			leaf("ingame.stop", tr("Quit Game"), QString::fromUtf8("\u25a0"), "game.stop"),
@@ -632,28 +801,28 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 			leaf("ingame.savestates", tr("Save States"), QString::fromUtf8("\u25a4"), "savestates"),
 		};
 	}
-	if (m_items[5].empty()) m_items[5].push_back(leaf("game.none", tr("No games in your library"), QString::fromUtf8("▶"), ""));
-	m_items[6] = { folder("network.remote", tr("Remote Play"), QString::fromUtf8("◎"), {leaf("network.remote.host", tr("Host This Game"), QString::fromUtf8("◎"), "remoteplay"), leaf("network.remote.join", tr("Join a Host"), QString::fromUtf8("◎"), "remoteplay")}),
+	if (m_items[6].empty()) m_items[6].push_back(leaf("game.none", tr("No games in your library"), QString::fromUtf8("▶"), ""));
+	m_items[7] = { folder("network.remote", tr("Remote Play"), QString::fromUtf8("◎"), {leaf("network.remote.host", tr("Host This Game"), QString::fromUtf8("◎"), "remoteplay"), leaf("network.remote.join", tr("Join a Host"), QString::fromUtf8("◎"), "remoteplay")}),
 		leaf("network.browser", tr("Internet Browser"), QString::fromUtf8("🌐"), "website") };
-	m_items[7] = { leaf("armsx3.news", tr("News"), QStringLiteral("ARMSX3_MARK"), "website", tr("ARMSX3 project updates")),
+	m_items[8] = { leaf("armsx3.news", tr("News"), QStringLiteral("ARMSX3_MARK"), "website", tr("ARMSX3 project updates")),
 		leaf("armsx3.discord", tr("Discord"), QStringLiteral("ARMSX3_MARK"), "discord"),
 		leaf("armsx3.github", tr("GitHub"), QStringLiteral("ARMSX3_MARK"), "github"), leaf("armsx3.about", tr("About ARMSX3"), QStringLiteral("ARMSX3_MARK"), "about") };
-	m_items[8] = { leaf("rpcn.friends", tr("Friends"), QString::fromUtf8("♙"), "rpcn.friends"),
+	m_items[9] = { leaf("rpcn.friends", tr("Friends"), QString::fromUtf8("♙"), "rpcn.friends"),
 		leaf("rpcn.account", tr("Account Management"), QString::fromUtf8("♙"), "rpcn") };
 	if (m_in_game)
-		m_items[8].insert(m_items[8].begin() + 1,
+		m_items[9].insert(m_items[9].begin() + 1,
 			folder("rpcn.remoteplay", tr("Remote Play"), QString::fromUtf8("◎"), {leaf("rpcn.remoteplay.host", tr("Host This Game"), QString::fromUtf8("◎"), "remoteplay")}));
 	if (m_in_game)
 	{
-		const QString friends_title = m_categories[8];
+		const QString friends_title = m_categories[9];
 		const auto old_images = m_category_images;
 		const auto old_focus = m_focus;
-		m_categories = {m_categories[0], m_categories[1], m_categories[2], m_categories[3], m_categories[5], friends_title};
-		m_category_images = {old_images[0], old_images[1], old_images[2], old_images[3], old_images[5], old_images[8]};
+		m_categories = {m_categories[0], m_categories[1], m_categories[2], m_categories[3], m_categories[6], friends_title};
+		m_category_images = {old_images[0], old_images[1], old_images[2], old_images[3], old_images[6], old_images[9]};
 		m_firmware_category_images = m_category_images;
 		m_items = {std::move(m_items[0]), std::move(m_items[1]), std::move(m_items[2]),
-			std::move(m_items[3]), std::move(m_items[5]), std::move(m_items[8])};
-		m_focus = {old_focus[0], old_focus[1], old_focus[2], old_focus[3], old_focus[5], old_focus[8]};
+			std::move(m_items[3]), std::move(m_items[6]), std::move(m_items[9])};
+		m_focus = {old_focus[0], old_focus[1], old_focus[2], old_focus[3], old_focus[6], old_focus[9]};
 		m_column = 4;
 		m_visual_column = 4.0f;
 	}
@@ -813,10 +982,51 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 		update();
 	});
 	m_game_audio_player = new QMediaPlayer(this);
+	m_game_audio_buffer = new QAudioBufferOutput(this);
+	m_game_audio_player->setAudioBufferOutput(m_game_audio_buffer);
+	connect(m_game_audio_buffer, &QAudioBufferOutput::audioBufferReceived, this, [this](const QAudioBuffer& buffer)
+	{
+		if (!m_wave_model || !buffer.isValid() || buffer.sampleCount() <= 0) return;
+		const int count = buffer.sampleCount();
+		double energy = 0.0;
+		switch (buffer.format().sampleFormat())
+		{
+		case QAudioFormat::Float:
+		{
+			const float* samples = buffer.constData<float>();
+			for (int i = 0; i < count; ++i) energy += double(samples[i]) * samples[i];
+			break;
+		}
+		case QAudioFormat::Int16:
+		{
+			const qint16* samples = buffer.constData<qint16>();
+			for (int i = 0; i < count; ++i) { const double sample = samples[i] / 32768.0; energy += sample * sample; }
+			break;
+		}
+		case QAudioFormat::Int32:
+		{
+			const qint32* samples = buffer.constData<qint32>();
+			for (int i = 0; i < count; ++i) { const double sample = samples[i] / 2147483648.0; energy += sample * sample; }
+			break;
+		}
+		case QAudioFormat::UInt8:
+		{
+			const quint8* samples = buffer.constData<quint8>();
+			for (int i = 0; i < count; ++i) { const double sample = (samples[i] - 128) / 128.0; energy += sample * sample; }
+			break;
+		}
+		default: return;
+		}
+		m_wave_model->set_drive(static_cast<float>(std::clamp(std::sqrt(energy / count) * 4.0, 0.0, 1.0)));
+	});
 	m_game_audio_output = new QAudioOutput(m_game_audio_player);
 	m_game_audio_output->setVolume(0.85f);
 	m_game_audio_player->setAudioOutput(m_game_audio_output);
 	m_game_audio_player->setLoops(QMediaPlayer::Infinite);
+	connect(m_game_audio_player, &QMediaPlayer::playbackStateChanged, this, [this](QMediaPlayer::PlaybackState state)
+	{
+		if (state != QMediaPlayer::PlayingState && m_wave_model) m_wave_model->set_drive(0.f);
+	});
 	m_game_audio_delay = new QTimer(this);
 	m_game_audio_delay->setSingleShot(true);
 	m_game_audio_delay->setInterval(1200);
@@ -836,6 +1046,46 @@ xmb_mode_dialog::xmb_mode_dialog(const std::vector<game_info>& games, bool in_ga
 			m_game_audio_player->play();
 		}
 	});
+	m_music_cover_watcher = new QFutureWatcher<QHash<QString, QImage>>(this);
+	connect(m_music_cover_watcher, &QFutureWatcher<QHash<QString, QImage>>::finished, this, [this]
+	{
+		const auto covers = m_music_cover_watcher->result();
+		std::function<void(item&)> apply_covers = [&](item& node)
+		{
+			if (covers.contains(node.key)) node.image = covers.value(node.key);
+			for (item& child : node.children) apply_covers(child);
+		};
+		for (auto& column : m_items) for (item& node : column) apply_covers(node);
+		update();
+	});
+	QVector<QPair<QString, QString>> music_cover_jobs;
+	std::function<void(const item&)> collect_covers = [&](const item& node)
+	{
+		if (node.key.startsWith(QStringLiteral("music.")) && music_cover_jobs.size() < 256)
+		{
+			for (const item& child : node.children)
+				if (child.action.startsWith(QStringLiteral("music.play:")))
+				{
+					const QString path = child.action.mid(QStringLiteral("music.play:").size());
+					if (QFileInfo(path).isFile()) music_cover_jobs.push_back({node.key, path});
+					break;
+				}
+		}
+		for (const item& child : node.children) collect_covers(child);
+	};
+	for (const item& node : m_items[3]) collect_covers(node);
+	if (!music_cover_jobs.isEmpty())
+		m_music_cover_watcher->setFuture(QtConcurrent::run([jobs = std::move(music_cover_jobs)]
+		{
+			QHash<QString, QImage> covers;
+			QHash<QString, QImage> decoded_paths;
+			for (const auto& [key, path] : jobs)
+			{
+				if (!decoded_paths.contains(path)) decoded_paths.insert(path, load_music_cover_image(path));
+				if (!decoded_paths.value(path).isNull()) covers.insert(key, decoded_paths.value(path));
+			}
+			return covers;
+		}));
 	load_missing_game_icons();
 	m_visual_focus = static_cast<float>(current_focus());
 	m_target_column = m_column;
@@ -896,23 +1146,60 @@ void xmb_mode_dialog::load_menu_sounds()
 	const QHash<QString, QString> theme_ids{{QStringLiteral("cursor"), QStringLiteral("se_cursor")},
 		{QStringLiteral("decide"), QStringLiteral("se_decide")}, {QStringLiteral("cancel"), QStringLiteral("se_cancel")},
 		{QStringLiteral("option"), QStringLiteral("se_optionmenu")}, {QStringLiteral("system_ok"), QStringLiteral("se_system_ok")}};
+	const QHash<QString, QStringList> custom_stems{{QStringLiteral("cursor"), {QStringLiteral("nav"), QStringLiteral("cursor")}},
+		{QStringLiteral("decide"), {QStringLiteral("select"), QStringLiteral("decide")}},
+		{QStringLiteral("cancel"), {QStringLiteral("back"), QStringLiteral("cancel")}},
+		{QStringLiteral("category"), {QStringLiteral("nav"), QStringLiteral("category")}},
+		{QStringLiteral("option"), {QStringLiteral("popup_open"), QStringLiteral("option")}},
+		{QStringLiteral("error"), {QStringLiteral("back"), QStringLiteral("error")}},
+		{QStringLiteral("system_ok"), {QStringLiteral("select"), QStringLiteral("system_ok")}}};
+	const QString custom_dir = QSettings().value(QStringLiteral("armsxpc/xmb/menuSfxFolder")).toString();
+	const float sound_volume = std::clamp(QSettings().value(QStringLiteral("armsxpc/xmb/menuSoundVolume"), 55).toInt() / 100.f, 0.f, 1.f);
 	for (auto it = firmware_ids.cbegin(); it != firmware_ids.cend(); ++it)
 	{
 		QByteArray wav = m_p3t_sounds.value(theme_ids.value(it.key()));
 		if (wav.isEmpty() && m_firmware) wav = m_firmware->sound(QStringLiteral("system_plugin"), it.value());
-		if (wav.isEmpty()) continue;
-		const QString path = cache + QStringLiteral("armsxpc-") + it.key() + QStringLiteral(".wav");
-		QFile file(path);
-		if (!file.open(QIODevice::WriteOnly) || file.write(wav) != wav.size()) continue;
+		QString custom_clip;
+		if (wav.isEmpty() && !custom_dir.isEmpty())
+		{
+			for (const QString& stem : custom_stems.value(it.key()))
+			{
+				for (const QString& extension : {QStringLiteral("wav"), QStringLiteral("ogg"), QStringLiteral("mp3")})
+				{
+					const QString candidate = QDir(custom_dir).filePath(stem + QLatin1Char('.') + extension);
+					if (QFileInfo(candidate).isFile()) { custom_clip = candidate; break; }
+				}
+				if (!custom_clip.isEmpty()) break;
+			}
+			if (!custom_clip.isEmpty())
+			{
+				const QString path = cache + QStringLiteral("armsxpc-custom-") + it.key() + QStringLiteral(".wav");
+				QFile::remove(path);
+				if (custom_clip.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive)) QFile::copy(custom_clip, path);
+				else _armsx3_xmbDecodeAudio(custom_clip.toStdString(), path.toStdString());
+				if (QFileInfo(path).isFile() && QFileInfo(path).size() > 44) custom_clip = path;
+				else custom_clip.clear();
+			}
+		}
+		if (wav.isEmpty() && custom_clip.isEmpty()) continue;
+		QString path;
+		if (!custom_clip.isEmpty()) path = custom_clip;
+		else
+		{
+			path = cache + QStringLiteral("armsxpc-") + it.key() + QStringLiteral(".wav");
+			QFile file(path);
+			if (!file.open(QIODevice::WriteOnly) || file.write(wav) != wav.size()) continue;
+		}
 		auto* effect = new QSoundEffect(this);
 		effect->setSource(QUrl::fromLocalFile(path));
-		effect->setVolume(0.55f);
+		effect->setVolume(sound_volume);
 		m_menu_sounds.insert(it.key(), effect);
 	}
 }
 
 void xmb_mode_dialog::play_menu_sound(const QString& sound)
 {
+	if (!QSettings().value(QStringLiteral("armsxpc/xmb/menuSounds"), true).toBool()) return;
 	if (QSoundEffect* effect = m_menu_sounds.value(sound, nullptr)) effect->play();
 }
 
@@ -981,10 +1268,27 @@ void xmb_mode_dialog::reset_custom_background()
 
 void xmb_mode_dialog::set_background_mode(int mode)
 {
-	m_background_mode = std::clamp(mode, 0, 2);
+	m_background_mode = mode == 2 ? 2 : 0;
 	QSettings().setValue(QStringLiteral("armsxpc/xmb/backgroundMode"), m_background_mode);
-	if (m_wave_widget) m_wave_widget->setVisible(!m_in_game && m_p3t_background.isNull() && m_background_mode != 1);
+	if (m_wave_widget) m_wave_widget->setVisible(!m_in_game && m_p3t_background.isNull());
 	update();
+}
+
+void xmb_mode_dialog::set_settings_overlay(bool open)
+{
+	if (m_wave_widget)
+		m_wave_widget->setVisible(!open && !m_in_game && m_p3t_background.isNull());
+}
+
+void xmb_mode_dialog::set_music_visualizer_overlay(bool open)
+{
+	if (open && m_wave_widget)
+		m_wave_widget->setVisible(!m_in_game && m_p3t_background.isNull());
+}
+
+void xmb_mode_dialog::set_wave_drive(float drive)
+{
+	if (m_wave_model) m_wave_model->set_drive(drive);
 }
 
 void xmb_mode_dialog::set_theme_month(int month)
@@ -1058,7 +1362,7 @@ void xmb_mode_dialog::update_game_version_labels()
 {
 	if (!m_in_game && m_items.size() > 5)
 	{
-		for (item& node : m_items[5])
+		for (item& node : m_items[6])
 			if (node.game >= 0 && node.game < m_games.size())
 				node.subtitle = game_subtitle(node.game);
 	}
@@ -1085,7 +1389,7 @@ void xmb_mode_dialog::refresh_game_backdrop()
 	if (m_show_game_backgrounds)
 	{
 		if (m_in_game) target = m_running_game;
-		else if (m_column == 5 && m_levels.empty())
+		else if (m_column == 6 && m_levels.empty())
 		{
 			const int focus = m_focus[m_column];
 			if (focus >= 0 && focus < static_cast<int>(m_items[m_column].size()))
@@ -1156,7 +1460,7 @@ void xmb_mode_dialog::load_missing_game_icons()
 void xmb_mode_dialog::refresh_focused_game_animation()
 {
 	int wanted = -1;
-	const int game_column = m_in_game ? 4 : 5;
+	const int game_column = m_in_game ? 4 : 6;
 	if (m_column == game_column && m_levels.empty() && m_path.empty())
 	{
 		const auto& items = current_items();
@@ -1187,8 +1491,15 @@ void xmb_mode_dialog::start_game_animation_load(int index)
 
 void xmb_mode_dialog::refresh_focused_game_audio()
 {
+	if (!QSettings().value(QStringLiteral("armsxpc/xmb/gameMusic"), true).toBool())
+	{
+		m_game_audio_target = -1;
+		m_game_audio_delay->stop();
+		m_game_audio_player->stop();
+		return;
+	}
 	int wanted = -1;
-	const int game_column = m_in_game ? 4 : 5;
+	const int game_column = m_in_game ? 4 : 6;
 	if (m_column == game_column && m_levels.empty() && m_path.empty())
 	{
 		const auto& items = current_items();
@@ -1266,7 +1577,7 @@ void xmb_mode_dialog::keyPressEvent(QKeyEvent* e)
 	{
 		if (m_options_open) { m_options_open = false; play_menu_sound(QStringLiteral("cancel")); update(); }
 		else if (!m_levels.empty()) { m_levels.pop_back(); m_path.pop_back(); m_level_titles.pop_back(); m_visual_focus = static_cast<float>(current_focus()); play_menu_sound(QStringLiteral("cancel")); update(); }
-		else reject();
+		else if (m_in_game) reject();
 		return;
 	}
 	if (e->key() == Qt::Key_Left || e->key() == Qt::Key_A)
@@ -1306,13 +1617,19 @@ void xmb_mode_dialog::keyPressEvent(QKeyEvent* e)
 				accept();
 			}
 			else if (m_option_focus == 0) emit actionRequested(QStringLiteral("game.play.%1").arg(m_option_game));
-			else if (m_option_focus == 1) emit actionRequested(QStringLiteral("game.settings.%1").arg(m_option_game));
+			else if (m_option_focus == 1 && m_option_game >= 0 && m_option_game < static_cast<int>(m_items[m_column].size()))
+			{
+				m_path.push_back(m_option_game);
+				m_levels.push_back(0);
+				m_level_titles.push_back(m_items[m_column][m_option_game].title);
+				m_visual_focus = 0.0f;
+			}
 			else if (m_option_focus == 2) emit actionRequested(QStringLiteral("game.cache.%1").arg(m_option_game));
 			update(); return;
 		}
 		play_menu_sound(QStringLiteral("decide")); launch_selected(); return;
 	}
-	if (e->key() == Qt::Key_Q && m_levels.empty() && m_column == 5 && (m_in_game || !m_games.empty()))
+	if (e->key() == Qt::Key_Q && m_levels.empty() && m_column == (m_in_game ? 4 : 6) && (m_in_game || !m_games.empty()))
 	{
 		m_options_open = true; m_option_focus = 0; m_option_game = m_focus[m_column]; play_menu_sound(QStringLiteral("option")); update(); return;
 	}

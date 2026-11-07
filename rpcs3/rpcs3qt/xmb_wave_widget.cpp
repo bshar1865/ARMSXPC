@@ -66,7 +66,7 @@ void main(){vUv=aPos*0.5+0.5;gl_Position=vec4(aPos,0.0,1.0);}
 
 	constexpr const char* composite_fragment = R"GLSL(#version 330 core
 in vec2 vUv; uniform sampler2D uLines; uniform vec3 uCol3; uniform vec3 uCol4; uniform float uGain; out vec4 oColor;
-void main(){float light=min(texture(uLines,vUv).r,0.53);oColor=vec4(mix(uCol3,uCol4,vUv.x)*light*uGain,0.0);}
+void main(){float light=min(texture(uLines,vUv).r,0.53);float alpha=clamp(light*uGain,0.0,1.0);oColor=vec4(mix(uCol3,uCol4,vUv.x)*alpha,alpha);}
 )GLSL";
 }
 
@@ -230,14 +230,17 @@ void xmb_wave_widget::draw_firmware_wave(int width, int height)
 	glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject()); glViewport(0, 0, width, height);
 	// Match LinesController's compositor: add the already-lit firmware colour to the
 	// background while preserving its alpha channel.
-	glEnable(GL_BLEND); glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE); glUseProgram(m_comp_program);
+	// This wave is rendered into a transparent QOpenGLWidget child, unlike Android's pass
+	// directly over its already-painted background. Emit premultiplied wave alpha so Qt's
+	// widget compositor can see the line instead of treating the whole pass as transparent.
+	glDisable(GL_BLEND); glUseProgram(m_comp_program);
 	glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, m_fbo_texture); glUniform1i(glGetUniformLocation(m_comp_program, "uLines"), 0);
 	const QColor c3 = m_firmware.wave_colour(3, QColor(216, 216, 216)), c4 = m_firmware.wave_colour(4, QColor(236, 235, 237));
 	glUniform3f(glGetUniformLocation(m_comp_program, "uCol3"), c3.redF(), c3.greenF(), c3.blueF());
 	glUniform3f(glGetUniformLocation(m_comp_program, "uCol4"), c4.redF(), c4.greenF(), c4.blueF());
 	glUniform1f(glGetUniformLocation(m_comp_program, "uGain"), wave_gain);
 	glBindVertexArray(m_quad_vao); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); glBindVertexArray(0);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
 void xmb_wave_widget::paintGL()

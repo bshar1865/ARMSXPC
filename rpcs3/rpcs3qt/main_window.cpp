@@ -51,6 +51,7 @@
 #include "config_database.h"
 #include "guest_memory_dumper.h"
 #include "xmb_mode_dialog.h"
+#include "xmb_file_browser_dialog.h"
 #include "xmb_firmware.h"
 #include "remote_play_capture_dialog.h"
 
@@ -60,6 +61,7 @@ extern atomic_t<bool> g_user_asked_for_screenshot;
 #include <unordered_set>
 
 #include <QScreen>
+#include <QApplication>
 #include <QDirIterator>
 #include <QMimeData>
 #include <QMessageBox>
@@ -71,6 +73,8 @@ extern atomic_t<bool> g_user_asked_for_screenshot;
 #include <QTemporaryFile>
 #include <QDesktopServices>
 #include <QAudioOutput>
+#include <QAudioBuffer>
+#include <QAudioBufferOutput>
 #include <QFileInfo>
 #include <QFile>
 #include <QDir>
@@ -81,8 +85,19 @@ extern atomic_t<bool> g_user_asked_for_screenshot;
 #include <QSettings>
 #include <QShortcut>
 #include <QMediaPlayer>
+#include <QMediaMetaData>
+#include <QCryptographicHash>
+#include <QFutureWatcher>
+#include <QSet>
+#include <QPointer>
+#include <QtConcurrent/QtConcurrentRun>
+#include <string_view>
+#include <QSlider>
+#include <QVideoWidget>
 #include <QUrl>
 #include <QVBoxLayout>
+
+extern "C" bool _armsx3_xmbDecodeAudio(std::string_view input, std::string_view output);
 
 #include "rpcs3_version.h"
 #include "Emu/IdManager.h"
@@ -91,6 +106,7 @@ extern atomic_t<bool> g_user_asked_for_screenshot;
 #include "Emu/System.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/system_config.h"
+#include "Emu/RSX/Overlays/overlays.h"
 #include "Emu/savestate_utils.hpp"
 #include "Emu/Cell/timers.hpp"
 
@@ -114,6 +130,8 @@ extern atomic_t<bool> g_user_asked_for_screenshot;
 
 #include <QEventLoop>
 #include <QTimer>
+
+extern "C" bool _armsx3_xmbExtractCoverArt(std::string_view input, std::string_view output);
 
 #ifdef _WIN32
 #include "raw_mouse_settings_dialog.h"
@@ -336,6 +354,14 @@ void main_window::show()
 
 	// Refresh gamelist when the main window is shown for the first time
 	m_game_list_frame->Refresh(true);
+
+	// Start in the firmware XMB after RPCS3's startup dialogs and initial show step.
+	if (!m_with_cli_boot)
+	{
+		// Avoid a flash of RPCS3's stock game-list UI: the XMB is the desktop home screen.
+		QMainWindow::hide();
+		QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+	}
 }
 
 void main_window::update_gui_pad_thread()
@@ -828,9 +854,20 @@ void main_window::ShowXmbMode()
 	{
 		QMessageBox::critical(this, tr("ARMSXPC XMB requires PS3 firmware"),
 			tr("Install a complete, valid PS3 firmware before opening the XMB.\n\n%1").arg(firmware_error));
+		show();
+		activateWindow();
 		return;
 	}
+	m_xmb_frontend_enabled = true;
 	m_xmb_mode_open = true;
+	// The main window is intentionally hidden while the XMB dialog owns the desktop.
+	// Prevent QApplication from quitting during that transition when it sees no visible
+	// top-level window between hide() and dialog.exec().
+	const bool restore_quit_on_last_window_closed = QApplication::quitOnLastWindowClosed();
+	QApplication::setQuitOnLastWindowClosed(false);
+	// The XMB is the desktop front end. Keep the RPCS3 main window and its menus, toolbar,
+	// game list, and docks out of the user's desktop while the firmware UI is active.
+	hide();
 	const bool in_game = !Emu.IsStopped();
 	const bool resume_after_xmb = Emu.GetStatus() == system_state::running;
 	game_info running_game;
@@ -845,47 +882,623 @@ void main_window::ShowXmbMode()
 	xmb_mode_dialog dialog(m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, in_game, running_game, this);
 	if (in_game) dialog.setWindowFlag(Qt::WindowStaysOnTopHint, true);
 	game_info requested_boot;
+	auto show_settings_panel = [this, &dialog](int tab, const gui_game_info* game)
+	{
+		auto* panel = new settings_dialog(m_gui_settings, m_emu_settings, std::clamp(tab, 0, 9), &dialog, game, true, "", true);
+		panel->set_xmb_mode();
+		connect(panel, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
+		connect(panel, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
+		connect(panel, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
+		connect(panel, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
+		if (m_log_frame) connect(panel, &settings_dialog::EmuSettingsApplied, m_log_frame, &log_frame::LoadSettings);
+		panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+		const int panel_left = qRound(dialog.width() * .42);
+		panel->setGeometry(panel_left, 0, dialog.width() - panel_left, dialog.height());
+		panel->setAttribute(Qt::WA_DeleteOnClose);
+		panel->setStyleSheet(QStringLiteral(
+			"QDialog { background: rgba(12, 14, 20, 242); color: #f2f2f2; }"
+			"QWidget { color: #f2f2f2; }"
+			"QTabWidget::pane { border: 1px solid rgba(255,255,255,45); background: rgba(18,20,27,235); }"
+			"QTabBar::tab { background: rgba(255,255,255,18); color: #eeeeee; padding: 8px 12px; }"
+			"QTabBar::tab:selected { background: rgba(160,130,220,95); }"
+			"QGroupBox { border: 1px solid rgba(255,255,255,55); margin-top: 9px; padding-top: 8px; }"
+			"QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit, QListWidget, QTreeWidget { background: rgba(0,0,0,95); color: #ffffff; border: 1px solid rgba(255,255,255,65); }"
+			"QPushButton { background: rgba(255,255,255,24); color: #ffffff; border: 1px solid rgba(255,255,255,65); padding: 5px 10px; }"
+			"QPushButton:hover { background: rgba(150,125,210,100); }"));
+		dialog.set_settings_overlay(true);
+		connect(panel, &QDialog::finished, &dialog, [&dialog] { dialog.set_settings_overlay(false); dialog.setFocus(Qt::OtherFocusReason); });
+		panel->show();
+		panel->raise();
+		panel->setFocus(Qt::OtherFocusReason);
+	};
+	auto show_file_browser = [&dialog](const QString& title, const QStringList& extensions, bool multiple,
+		bool select_folder, std::function<void(const QStringList&)> on_selected)
+	{
+		auto* panel = new xmb_file_browser_dialog(title, extensions, multiple, select_folder, &dialog);
+		const int panel_left = qRound(dialog.width() * .42);
+		panel->setGeometry(panel_left, 0, dialog.width() - panel_left, dialog.height());
+		panel->setAttribute(Qt::WA_DeleteOnClose);
+		dialog.set_settings_overlay(true);
+		QObject::connect(panel, &QDialog::finished, &dialog, [&dialog, panel, on_selected = std::move(on_selected)](int result)
+		{
+			dialog.set_settings_overlay(false);
+			dialog.setFocus(Qt::OtherFocusReason);
+			if (result == QDialog::Accepted) on_selected(panel->selected_paths());
+		});
+		panel->show();
+		panel->raise();
+		panel->setFocus(Qt::OtherFocusReason);
+	};
+	auto show_xmb_panel = [&dialog](QWidget* panel)
+	{
+		panel->setParent(&dialog);
+		panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+		if (auto* dialog_panel = qobject_cast<QDialog*>(panel)) dialog_panel->setWindowModality(Qt::NonModal);
+		panel->setGeometry(dialog.rect());
+		panel->setAttribute(Qt::WA_DeleteOnClose);
+		panel->setStyleSheet(QStringLiteral(
+			"QDialog { background: rgba(8,10,16,248); color: #f2f2f2; } QWidget { color: #f2f2f2; }"
+			"QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit, QListWidget, QTreeWidget, QTableWidget { background: rgba(0,0,0,110); color: white; }"
+			"QPushButton { background: rgba(255,255,255,24); color: white; border: 1px solid rgba(255,255,255,65); padding: 6px 10px; }"));
+		dialog.set_settings_overlay(true);
+		auto restore_xmb_focus = [&dialog]
+		{
+			dialog.set_settings_overlay(false);
+			dialog.setFocus(Qt::OtherFocusReason);
+		};
+		if (auto* dialog_panel = qobject_cast<QDialog*>(panel))
+			QObject::connect(dialog_panel, &QDialog::finished, &dialog, restore_xmb_focus);
+		else
+			QObject::connect(panel, &QObject::destroyed, &dialog, restore_xmb_focus);
+		panel->show();
+		panel->raise();
+		panel->setFocus(Qt::OtherFocusReason);
+	};
+	auto show_xmb_widget = [&dialog, &show_xmb_panel](QWidget* content, const QString& title)
+	{
+		auto* wrapper = new QDialog(&dialog);
+		wrapper->setWindowTitle(title);
+		wrapper->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+		auto* layout = new QVBoxLayout(wrapper);
+		layout->setContentsMargins(18, 12, 18, 16);
+		auto* header = new QHBoxLayout;
+		header->addWidget(new QLabel(title, wrapper));
+		header->addStretch();
+		auto* back = new QPushButton(QObject::tr("Back to XMB"), wrapper);
+		header->addWidget(back);
+		layout->addLayout(header);
+		content->setParent(wrapper);
+		content->setWindowFlags(Qt::Widget);
+		layout->addWidget(content, 1);
+		QObject::connect(back, &QPushButton::clicked, wrapper, &QDialog::accept);
+		show_xmb_panel(wrapper);
+	};
+	auto show_video_playlist = [this, &dialog](QStringList paths, const QString& playlist_name)
+	{
+		paths.erase(std::remove_if(paths.begin(), paths.end(), [](const QString& path) { return !QFileInfo(path).isFile(); }), paths.end());
+		if (paths.isEmpty()) { QMessageBox::information(&dialog, tr("Video Player"), tr("There are no playable videos in this list.")); return; }
+		auto* panel = new QDialog(&dialog);
+		panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint); panel->setAttribute(Qt::WA_DeleteOnClose); panel->setGeometry(dialog.rect());
+		panel->setStyleSheet(QStringLiteral("QDialog { background: #050609; color: white; } QLabel { color: white; } QPushButton { background: rgba(255,255,255,24); color: white; border: 1px solid rgba(255,255,255,65); padding: 7px 12px; }"));
+		auto* layout = new QVBoxLayout(panel); layout->setContentsMargins(30, 22, 30, 24);
+		auto* title = new QLabel(playlist_name, panel); title->setAlignment(Qt::AlignCenter);
+		auto* video = new QVideoWidget(panel); video->setMinimumSize(480, 270); video->setStyleSheet(QStringLiteral("background: black;"));
+		auto* controls = new QHBoxLayout;
+		auto* previous = new QPushButton(tr("Previous"), panel); auto* toggle = new QPushButton(tr("Pause"), panel);
+		auto* next = new QPushButton(tr("Next"), panel); auto* close = new QPushButton(tr("Back to XMB"), panel);
+		controls->addWidget(previous); controls->addWidget(toggle); controls->addWidget(next); controls->addStretch(); controls->addWidget(close);
+		layout->addWidget(title); layout->addWidget(video, 1); layout->addLayout(controls);
+		auto* media = new QMediaPlayer(panel); auto* output = new QAudioOutput(media); media->setAudioOutput(output); media->setVideoOutput(video);
+		auto tracks = std::make_shared<QStringList>(std::move(paths)); auto current = std::make_shared<int>(0);
+		auto play_index = std::make_shared<std::function<void(int)>>();
+		*play_index = [tracks, current, media, title, toggle](int selected)
+		{
+			*current = (selected + static_cast<int>(tracks->size())) % static_cast<int>(tracks->size());
+			title->setText(QStringLiteral("%1\n%2 / %3").arg(QFileInfo(tracks->at(*current)).completeBaseName()).arg(*current + 1).arg(tracks->size()));
+			media->stop();
+			media->setSource(QUrl::fromLocalFile(tracks->at(*current))); media->play(); toggle->setText(QObject::tr("Pause"));
+		};
+		connect(previous, &QPushButton::clicked, panel, [play_index, current] { (*play_index)(*current - 1); });
+		connect(next, &QPushButton::clicked, panel, [play_index, current] { (*play_index)(*current + 1); });
+		connect(toggle, &QPushButton::clicked, panel, [media, toggle]
+		{
+			if (media->playbackState() == QMediaPlayer::PlayingState) { media->pause(); toggle->setText(QObject::tr("Play")); }
+			else { media->play(); toggle->setText(QObject::tr("Pause")); }
+		});
+		connect(media, &QMediaPlayer::playbackStateChanged, panel, [toggle](QMediaPlayer::PlaybackState state) { toggle->setText(state == QMediaPlayer::PlayingState ? QObject::tr("Pause") : QObject::tr("Play")); });
+		connect(media, &QMediaPlayer::mediaStatusChanged, panel, [this, panel, play_index, current, media, tracks, title](QMediaPlayer::MediaStatus state)
+		{
+			if (state == QMediaPlayer::EndOfMedia)
+			{
+				const int ended_index = *current;
+				const QUrl ended_source = media->source();
+				QTimer::singleShot(0, panel, [play_index, current, media, tracks, ended_index, ended_source]
+				{
+					if (*current == ended_index && tracks->at(ended_index) == ended_source.toLocalFile() &&
+						media->source() == ended_source && media->mediaStatus() == QMediaPlayer::EndOfMedia)
+						(*play_index)(ended_index + 1);
+				});
+			}
+			else if (state == QMediaPlayer::InvalidMedia) title->setText(tr("This video format could not be played by the installed Qt multimedia backend."));
+		});
+		connect(close, &QPushButton::clicked, panel, &QDialog::close);
+		connect(panel, &QDialog::finished, &dialog, [media, &dialog] { media->stop(); dialog.set_settings_overlay(false); dialog.setFocus(Qt::OtherFocusReason); });
+		dialog.set_settings_overlay(true); (*play_index)(0); panel->show(); panel->raise(); panel->setFocus(Qt::OtherFocusReason);
+	};
+	auto ensure_xmb_music_player = [this]
+	{
+		if (m_xmb_music_player) return;
+		m_xmb_music_player = new QMediaPlayer(this);
+		m_xmb_music_output = new QAudioOutput(m_xmb_music_player);
+		m_xmb_music_output->setVolume(.8f);
+		m_xmb_music_player->setAudioOutput(m_xmb_music_output);
+		m_xmb_music_buffer = new QAudioBufferOutput(m_xmb_music_player);
+		m_xmb_music_player->setAudioBufferOutput(m_xmb_music_buffer);
+		connect(m_xmb_music_player, &QMediaPlayer::mediaStatusChanged, this, [this](QMediaPlayer::MediaStatus status)
+		{
+			if (status != QMediaPlayer::EndOfMedia || m_xmb_music_queue.isEmpty()) return;
+			const quint64 generation = m_xmb_music_generation;
+			const int ended_index = m_xmb_music_index;
+			const QUrl ended_source = m_xmb_music_player->source();
+			QTimer::singleShot(0, this, [this, generation, ended_index, ended_source]
+			{
+				// Ignore EndOfMedia queued by the decoder we just replaced with Previous/Next.
+				if (generation != m_xmb_music_generation || ended_index != m_xmb_music_index ||
+					m_xmb_music_player->source() != ended_source || m_xmb_music_player->mediaStatus() != QMediaPlayer::EndOfMedia) return;
+				m_xmb_music_index = (m_xmb_music_index + 1) % m_xmb_music_queue.size();
+				++m_xmb_music_generation;
+				m_xmb_music_player->stop();
+				m_xmb_music_player->setSource(QUrl::fromLocalFile(m_xmb_music_queue[m_xmb_music_index]));
+				m_xmb_music_player->play();
+			});
+		});
+	};
+	auto start_xmb_music = [this, &ensure_xmb_music_player](QStringList paths, int start_index)
+	{
+		paths.erase(std::remove_if(paths.begin(), paths.end(), [](const QString& path) { return !QFileInfo(path).isFile(); }), paths.end());
+		if (paths.isEmpty()) return false;
+		ensure_xmb_music_player();
+		m_xmb_music_queue = std::move(paths);
+		m_xmb_music_index = std::clamp(start_index, 0, static_cast<int>(m_xmb_music_queue.size()) - 1);
+		++m_xmb_music_generation;
+		m_xmb_music_player->stop();
+		m_xmb_music_player->setSource(QUrl::fromLocalFile(m_xmb_music_queue[m_xmb_music_index]));
+		m_xmb_music_player->play();
+		return true;
+	};
+	auto xmb_library_tracks = [this]
+	{
+		QStringList tracks;
+		const QString custom_track = QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicTrack")).toString();
+		if (QFileInfo(custom_track).isFile()) return QStringList{custom_track};
+		QString root = QSettings().value(QStringLiteral("armsxpc/xmb/musicFolder")).toString();
+		if (root.isEmpty()) root = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/music/");
+		const QStringList formats{QStringLiteral("mp3"), QStringLiteral("ogg"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus")};
+		QDirIterator it(root, QDir::Files, QDirIterator::Subdirectories);
+		while (it.hasNext())
+		{
+			const QString path = it.next();
+			if (formats.contains(QFileInfo(path).suffix(), Qt::CaseInsensitive)) tracks.push_back(path);
+		}
+		std::sort(tracks.begin(), tracks.end(), [](const QString& a, const QString& b) { return a.compare(b, Qt::CaseInsensitive) < 0; });
+		return tracks;
+	};
+	auto show_music_player = [this, &dialog, &ensure_xmb_music_player](QStringList paths, int start_index, const QString& heading)
+	{
+		paths.erase(std::remove_if(paths.begin(), paths.end(), [](const QString& path) { return !QFileInfo(path).isFile(); }), paths.end());
+		if (paths.isEmpty()) { QMessageBox::information(&dialog, tr("Music Player"), tr("There are no playable tracks in this list.")); return; }
+		ensure_xmb_music_player();
+		auto* panel = new QDialog(&dialog);
+		panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+		// Keep the transport panel and its UI state around when Back returns to the XMB.
+		// The actual player is owned by main_window, so playback survives the panel and XMB dialogs.
+		panel->setGeometry(dialog.rect());
+		panel->setStyleSheet(QStringLiteral("QDialog { background: rgba(5,7,12,220); color: white; } QLabel { color: white; } QPushButton { background: rgba(255,255,255,24); color: white; border: 1px solid rgba(255,255,255,65); padding: 7px 12px; } QSlider::groove:horizontal { height: 4px; background: rgba(255,255,255,80); } QSlider::handle:horizontal { width: 12px; margin: -5px 0; border-radius: 6px; background: white; }"));
+		auto* layout = new QVBoxLayout(panel);
+		layout->setContentsMargins(48, 30, 48, 32);
+		auto* heading_label = new QLabel(heading, panel);
+		heading_label->setAlignment(Qt::AlignCenter);
+		auto* cover = new QLabel(panel);
+		cover->setAlignment(Qt::AlignCenter);
+		cover->setMinimumHeight(220);
+		auto* title = new QLabel(panel);
+		title->setAlignment(Qt::AlignCenter);
+		QFont title_font = title->font(); title_font.setPointSize(20); title_font.setWeight(QFont::DemiBold); title->setFont(title_font);
+		auto* seek = new QSlider(Qt::Horizontal, panel); seek->setRange(0, 0);
+		auto* controls = new QHBoxLayout;
+		auto* previous = new QPushButton(tr("Previous"), panel);
+		auto* toggle = new QPushButton(tr("Pause"), panel);
+		auto* next = new QPushButton(tr("Next"), panel);
+		auto* volume = new QSlider(Qt::Horizontal, panel); volume->setRange(0, 100); volume->setValue(80); volume->setMaximumWidth(150);
+		auto* close = new QPushButton(tr("Back to XMB"), panel);
+		auto* elapsed = new QLabel(tr("00:00 / 00:00"), panel);
+		controls->addWidget(previous); controls->addWidget(toggle); controls->addWidget(next); controls->addWidget(elapsed); controls->addStretch();
+		controls->addWidget(new QLabel(tr("Volume"), panel)); controls->addWidget(volume); controls->addWidget(close);
+		layout->addWidget(heading_label);
+		layout->addWidget(cover, 1);
+		layout->addWidget(title);
+		layout->addWidget(seek);
+		layout->addLayout(controls);
+
+		auto* media = m_xmb_music_player;
+		auto* output = m_xmb_music_output;
+		auto* buffer_output = m_xmb_music_buffer;
+		auto tracks = std::make_shared<QStringList>(std::move(paths));
+		auto current_index = std::make_shared<int>(0);
+		auto cover_attempts = std::make_shared<QSet<QString>>();
+		auto play_index = std::make_shared<std::function<void(int)>>();
+		*play_index = [this, tracks, current_index, media, title, cover, toggle](int selected)
+		{
+			*current_index = (selected + tracks->size()) % tracks->size();
+			// Keep the transport queue independent of the XMB panel lifetime so it can
+			// continue while the user browses games or another XMB column.
+			m_xmb_music_queue = *tracks;
+			m_xmb_music_index = *current_index;
+			++m_xmb_music_generation;
+			title->setText(QFileInfo(tracks->at(*current_index)).completeBaseName());
+			cover->clear();
+			// Stop the prior source before replacing it. Qt backends can still deliver a queued
+			// EndOfMedia notification while setSource tears down the old decoder.
+			media->stop();
+			media->setSource(QUrl::fromLocalFile(tracks->at(*current_index))); media->play(); toggle->setText(QObject::tr("Pause"));
+		};
+		const auto format_time = [](qint64 ms)
+		{
+			return QStringLiteral("%1:%2").arg(ms / 60000, 2, 10, QLatin1Char('0')).arg((ms / 1000) % 60, 2, 10, QLatin1Char('0'));
+		};
+		connect(previous, &QPushButton::clicked, panel, [play_index, current_index] { (*play_index)(*current_index - 1); });
+		connect(next, &QPushButton::clicked, panel, [play_index, current_index] { (*play_index)(*current_index + 1); });
+		connect(toggle, &QPushButton::clicked, panel, [media, toggle]
+		{
+			if (media->playbackState() == QMediaPlayer::PlayingState) { media->pause(); toggle->setText(QObject::tr("Play")); }
+			else { media->play(); toggle->setText(QObject::tr("Pause")); }
+		});
+		connect(volume, &QSlider::valueChanged, output, [output](int value) { output->setVolume(value / 100.f); });
+		connect(seek, &QSlider::sliderMoved, media, &QMediaPlayer::setPosition);
+		connect(media, &QMediaPlayer::durationChanged, panel, [seek](qint64 duration) { seek->setRange(0, static_cast<int>(std::min<qint64>(duration, std::numeric_limits<int>::max()))); });
+		connect(media, &QMediaPlayer::positionChanged, panel, [seek, elapsed, media, format_time](qint64 position)
+		{
+			if (!seek->isSliderDown()) seek->setValue(static_cast<int>(position));
+			elapsed->setText(QStringLiteral("%1 / %2").arg(format_time(position), format_time(media->duration())));
+		});
+		connect(media, &QMediaPlayer::sourceChanged, panel, [tracks, current_index, title, cover](const QUrl& source)
+		{
+			const int index = tracks->indexOf(source.toLocalFile());
+			if (index < 0) return;
+			*current_index = index;
+			title->setText(QFileInfo(tracks->at(index)).completeBaseName());
+			cover->clear();
+		});
+		connect(media, &QMediaPlayer::metaDataChanged, panel, [media, title, cover, panel, tracks, current_index, cover_attempts]
+		{
+			const QString track = media->metaData().value(QMediaMetaData::Key::Title).toString();
+			if (!track.isEmpty()) title->setText(track);
+			QImage artwork = media->metaData().value(QMediaMetaData::Key::CoverArtImage).value<QImage>();
+			if (artwork.isNull()) artwork = media->metaData().value(QMediaMetaData::Key::ThumbnailImage).value<QImage>();
+			if (!artwork.isNull())
+			{
+				cover->setPixmap(QPixmap::fromImage(artwork).scaled(320, 220, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+				return;
+			}
+
+			const int index = *current_index;
+			if (index < 0 || index >= tracks->size()) return;
+			const QString path = tracks->at(index);
+			if (cover_attempts->contains(path)) return;
+			cover_attempts->insert(path);
+			const QString cache_path = QDir::tempPath() + QStringLiteral("/armsxpc-cover-") +
+				QString::fromLatin1(QCryptographicHash::hash(path.toUtf8(), QCryptographicHash::Sha256).toHex()) + QStringLiteral(".img");
+			auto* watcher = new QFutureWatcher<QImage>(panel);
+			QObject::connect(watcher, &QFutureWatcher<QImage>::finished, panel, [watcher, media, cover, path]
+			{
+				const QImage embedded = watcher->result();
+				watcher->deleteLater();
+				if (!embedded.isNull() && media->source().toLocalFile() == path)
+					cover->setPixmap(QPixmap::fromImage(embedded).scaled(320, 220, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+			});
+			watcher->setFuture(QtConcurrent::run([path, cache_path]
+			{
+				QImage image(cache_path);
+				if (image.isNull())
+				{
+					QFile::remove(cache_path);
+					if (_armsx3_xmbExtractCoverArt(path.toStdString(), cache_path.toStdString())) image.load(cache_path);
+				}
+				return image;
+			}));
+		});
+		connect(media, &QMediaPlayer::mediaStatusChanged, panel, [this, title](QMediaPlayer::MediaStatus status)
+		{
+			if (status == QMediaPlayer::InvalidMedia) title->setText(tr("This audio format could not be played."));
+		});
+		connect(buffer_output, &QAudioBufferOutput::audioBufferReceived, panel, [this, &dialog](const QAudioBuffer& buffer)
+		{
+			const int count = buffer.sampleCount(); if (count <= 0) return;
+			double energy = 0.0;
+			switch (buffer.format().sampleFormat())
+			{
+			case QAudioFormat::Float: { const float* p = buffer.constData<float>(); for (int i = 0; i < count; ++i) energy += double(p[i]) * p[i]; break; }
+			case QAudioFormat::Int16: { const qint16* p = buffer.constData<qint16>(); for (int i = 0; i < count; ++i) { const double v = p[i] / 32768.0; energy += v * v; } break; }
+			case QAudioFormat::Int32: { const qint32* p = buffer.constData<qint32>(); for (int i = 0; i < count; ++i) { const double v = p[i] / 2147483648.0; energy += v * v; } break; }
+			case QAudioFormat::UInt8: { const quint8* p = buffer.constData<quint8>(); for (int i = 0; i < count; ++i) { const double v = (p[i] - 128) / 128.0; energy += v * v; } break; }
+			default: return;
+			}
+			dialog.set_wave_drive(static_cast<float>(std::clamp(std::sqrt(energy / count) * 4.0, 0.0, 1.0)));
+		});
+		connect(close, &QPushButton::clicked, panel, [panel, &dialog]
+		{
+			panel->hide();
+			dialog.set_wave_drive(0.f);
+			dialog.set_music_visualizer_overlay(false);
+			dialog.set_settings_overlay(false);
+			dialog.setFocus(Qt::OtherFocusReason);
+		});
+		connect(panel, &QDialog::finished, &dialog, [&dialog] { dialog.set_wave_drive(0.f); dialog.set_music_visualizer_overlay(false); dialog.set_settings_overlay(false); dialog.setFocus(Qt::OtherFocusReason); });
+		dialog.set_settings_overlay(true);
+		dialog.set_music_visualizer_overlay(true);
+		(*play_index)(std::clamp(start_index, 0, static_cast<int>(tracks->size()) - 1));
+		panel->show(); panel->raise(); panel->setFocus(Qt::OtherFocusReason);
+	};
 	connect(&dialog, &xmb_mode_dialog::bootRequested, &dialog, [&dialog, &requested_boot](const game_info& game)
 	{
 		requested_boot = game;
 		dialog.accept();
 	});
-	connect(&dialog, &xmb_mode_dialog::actionRequested, this, [this, &dialog, in_game](const QString& action)
+	connect(&dialog, &xmb_mode_dialog::actionRequested, this, [this, &dialog, &show_settings_panel, &show_file_browser, &show_xmb_panel, &show_xmb_widget, &show_video_playlist, &show_music_player, &start_xmb_music, &xmb_library_tracks, &requested_boot, in_game](const QString& action)
 	{
-		if (action == "osd.toggle")
+		if (action == "music.setting.sfx.pack")
+		{
+			show_file_browser(tr("Import Menu Sound Pack"), {}, false, true,
+				[this, &dialog](const QStringList& paths)
+				{
+					if (paths.isEmpty()) return;
+					const QString source = paths.front();
+					const QString destination = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/menu_sfx/");
+					QDir().mkpath(destination);
+					QDir target(destination);
+					for (const QFileInfo& old : target.entryInfoList(QDir::Files | QDir::NoDotAndDotDot)) QFile::remove(old.absoluteFilePath());
+					const QSet<QString> accepted{QStringLiteral("nav"), QStringLiteral("select"), QStringLiteral("submenu"), QStringLiteral("menu"), QStringLiteral("back"), QStringLiteral("toggle_on"), QStringLiteral("toggle_off"), QStringLiteral("reset"), QStringLiteral("slider"), QStringLiteral("sleep"), QStringLiteral("wake"), QStringLiteral("popup_open"), QStringLiteral("popup_close"), QStringLiteral("cursor"), QStringLiteral("decide"), QStringLiteral("cancel"), QStringLiteral("category"), QStringLiteral("option"), QStringLiteral("error"), QStringLiteral("system_ok")};
+					int copied = 0;
+					const QDir source_dir(source);
+					for (const QFileInfo& file : source_dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot))
+					{
+						if (!accepted.contains(file.completeBaseName().toLower()) || !QStringList{QStringLiteral("wav"), QStringLiteral("ogg"), QStringLiteral("mp3")}.contains(file.suffix(), Qt::CaseInsensitive)) continue;
+						if (QFile::copy(file.absoluteFilePath(), target.filePath(file.fileName().toLower()))) ++copied;
+					}
+					if (!copied)
+					{
+						QMessageBox::information(&dialog, tr("Menu Sound Pack"), tr("No supported named clips were found. Add files named nav, select, back, toggle_on, popup_open, or another supported menu event."));
+						return;
+					}
+					QSettings().setValue(QStringLiteral("armsxpc/xmb/menuSfxFolder"), destination);
+					dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+				});
+			return;
+		}
+		if (action == "music.setting.sfx.reset")
+		{
+			const QString directory = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/menu_sfx/");
+			for (const QFileInfo& file : QDir(directory).entryInfoList(QDir::Files | QDir::NoDotAndDotDot)) QFile::remove(file.absoluteFilePath());
+			QSettings().remove(QStringLiteral("armsxpc/xmb/menuSfxFolder"));
+			dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+			return;
+		}
+		if (action == "music.setting.sfx.volume.up" || action == "music.setting.sfx.volume.down")
+		{
+			QSettings settings;
+			const int delta = action.endsWith(QStringLiteral("up")) ? 10 : -10;
+			settings.setValue(QStringLiteral("armsxpc/xmb/menuSoundVolume"), std::clamp(settings.value(QStringLiteral("armsxpc/xmb/menuSoundVolume"), 55).toInt() + delta, 0, 100));
+			dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+			return;
+		}
+		if (action.startsWith("music.setting.library.volume.") || action.startsWith("music.setting.pause.volume."))
+		{
+			const bool library = action.startsWith("music.setting.library.");
+			const QString key = library ? QStringLiteral("armsxpc/xmb/libraryMusicVolume") : QStringLiteral("armsxpc/xmb/pauseMusicVolume");
+			const int delta = action.endsWith(QStringLiteral("up")) ? 10 : -10;
+			const int volume = std::clamp(QSettings().value(key, 15).toInt() + delta, 0, 100);
+			QSettings().setValue(key, volume);
+			if (library && m_xmb_music_output) m_xmb_music_output->setVolume(volume / 100.f);
+			if (!library && m_xmb_pause_music_output) m_xmb_pause_music_output->setVolume(volume / 100.f);
+			dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+			return;
+		}
+		if (action == "music.setting.trophy.select")
+		{
+			show_file_browser(tr("Choose Trophy Sound"), {QStringLiteral("wav"), QStringLiteral("ogg"), QStringLiteral("mp3")}, false, false,
+				[this, &dialog](const QStringList& paths)
+				{
+					if (paths.isEmpty()) return;
+					const QString directory = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("sounds/");
+					QDir().mkpath(directory);
+					const QString destination = directory + QStringLiteral("snd_trophy.wav");
+					const QString temporary = destination + QStringLiteral(".armsxpc-tmp.wav");
+					QFile::remove(temporary);
+					const std::string input = QFileInfo(paths.front()).absoluteFilePath().toStdString();
+					const std::string output = temporary.toStdString();
+					if (!_armsx3_xmbDecodeAudio(input, output))
+					{
+						QMessageBox::warning(&dialog, tr("Trophy Sound"), tr("The selected audio file could not be decoded."));
+						return;
+					}
+					QFile::remove(destination);
+					if (!QFile::rename(temporary, destination))
+					{
+						QFile::remove(temporary);
+						QMessageBox::warning(&dialog, tr("Trophy Sound"), tr("Could not install the trophy sound in the RPCS3 sounds folder."));
+						return;
+					}
+					dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+				});
+			return;
+		}
+		if (action == "music.setting.trophy.test")
+		{
+			const QString path = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("sounds/snd_trophy.wav");
+			if (QFileInfo(path).isFile()) rsx::overlays::play_sound(rsx::overlays::sound_effect::trophy, 1.0f);
+			else QMessageBox::information(&dialog, tr("Trophy Sound"), tr("Choose a trophy sound file first."));
+			return;
+		}
+		if (action == "music.setting.trophy.clear")
+		{
+			QFile::remove(QString::fromStdString(fs::get_config_dir()) + QStringLiteral("sounds/snd_trophy.wav"));
+			dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+			return;
+		}
+		if (action == "music.setting.library.select")
+		{
+			show_file_browser(tr("Choose Library Background Music"), {QStringLiteral("mp3"), QStringLiteral("ogg"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus")}, false, false,
+				[this, &dialog, &start_xmb_music](const QStringList& paths)
+				{
+					if (paths.isEmpty()) return;
+					const QString path = QFileInfo(paths.front()).absoluteFilePath();
+					QSettings().setValue(QStringLiteral("armsxpc/xmb/libraryMusicTrack"), path);
+					if (QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusic"), false).toBool())
+					{
+						start_xmb_music({path}, 0);
+						if (m_xmb_music_output) m_xmb_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicVolume"), 15).toInt() / 100.f);
+					}
+					dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+				});
+			return;
+		}
+		if (action == "music.setting.library.reset")
+		{
+			QSettings().remove(QStringLiteral("armsxpc/xmb/libraryMusicTrack"));
+			if (QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusic"), false).toBool())
+			{
+				QStringList tracks = xmb_library_tracks();
+				if (!tracks.isEmpty()) { start_xmb_music(std::move(tracks), 0); if (m_xmb_music_output) m_xmb_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicVolume"), 15).toInt() / 100.f); }
+			}
+			dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+			return;
+		}
+		if (action == "music.setting.pause.select")
+		{
+			show_file_browser(tr("Choose Pause Menu Music"), {QStringLiteral("mp3"), QStringLiteral("ogg"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus")}, false, false,
+				[this, &dialog, in_game](const QStringList& paths)
+				{
+					if (paths.isEmpty()) return;
+					const QString path = QFileInfo(paths.front()).absoluteFilePath();
+					QSettings().setValue(QStringLiteral("armsxpc/xmb/pauseMusicTrack"), path);
+					if (in_game && QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusic"), false).toBool())
+					{
+						if (!m_xmb_pause_music_player) { m_xmb_pause_music_player = new QMediaPlayer(this); m_xmb_pause_music_player->setLoops(QMediaPlayer::Infinite); m_xmb_pause_music_output = new QAudioOutput(m_xmb_pause_music_player); m_xmb_pause_music_player->setAudioOutput(m_xmb_pause_music_output); }
+						m_xmb_pause_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusicVolume"), 15).toInt() / 100.f);
+						m_xmb_pause_music_player->stop(); m_xmb_pause_music_player->setSource(QUrl::fromLocalFile(path)); m_xmb_pause_music_player->play();
+					}
+					dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+				});
+			return;
+		}
+		if (action == "music.setting.pause")
+		{
+			QSettings settings;
+			const bool enable = !settings.value(QStringLiteral("armsxpc/xmb/pauseMusic"), false).toBool();
+			const QString track = settings.value(QStringLiteral("armsxpc/xmb/pauseMusicTrack")).toString();
+			if (!enable)
+			{
+				settings.setValue(QStringLiteral("armsxpc/xmb/pauseMusic"), false);
+				if (m_xmb_pause_music_player) m_xmb_pause_music_player->stop();
+				dialog.accept(); return;
+			}
+			if (QFileInfo(track).isFile())
+			{
+				settings.setValue(QStringLiteral("armsxpc/xmb/pauseMusic"), true);
+				if (in_game)
+				{
+				if (!m_xmb_pause_music_player) { m_xmb_pause_music_player = new QMediaPlayer(this); m_xmb_pause_music_player->setLoops(QMediaPlayer::Infinite); m_xmb_pause_music_output = new QAudioOutput(m_xmb_pause_music_player); m_xmb_pause_music_player->setAudioOutput(m_xmb_pause_music_output); }
+					m_xmb_pause_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusicVolume"), 15).toInt() / 100.f);
+					m_xmb_pause_music_player->stop(); m_xmb_pause_music_player->setSource(QUrl::fromLocalFile(track)); m_xmb_pause_music_player->play();
+				}
+				dialog.accept(); return;
+			}
+			show_file_browser(tr("Choose Pause Menu Music"), {QStringLiteral("mp3"), QStringLiteral("ogg"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus")}, false, false,
+				[this, &dialog](const QStringList& paths)
+				{
+					if (!paths.isEmpty())
+					{
+						const QString path = QFileInfo(paths.front()).absoluteFilePath();
+						QSettings settings; settings.setValue(QStringLiteral("armsxpc/xmb/pauseMusicTrack"), path); settings.setValue(QStringLiteral("armsxpc/xmb/pauseMusic"), true);
+						dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+					}
+				});
+			return;
+		}
+		if (action == "music.setting.game" || action == "music.setting.library" || action == "music.setting.sfx")
+		{
+			QSettings settings;
+			const QString key = action == "music.setting.game" ? QStringLiteral("armsxpc/xmb/gameMusic") :
+				action == "music.setting.library" ? QStringLiteral("armsxpc/xmb/libraryMusic") : QStringLiteral("armsxpc/xmb/menuSounds");
+			const bool enabled = !settings.value(key, action != "music.setting.library").toBool();
+			settings.setValue(key, enabled);
+			if (action == "music.setting.library")
+			{
+				if (enabled)
+				{
+					QStringList tracks = xmb_library_tracks();
+					if (tracks.isEmpty()) settings.setValue(key, false);
+					else
+					{
+						start_xmb_music(std::move(tracks), 0);
+						if (m_xmb_music_output) m_xmb_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicVolume"), 15).toInt() / 100.f);
+					}
+				}
+				else if (m_xmb_music_player) { ++m_xmb_music_generation; m_xmb_music_player->stop(); m_xmb_music_queue.clear(); m_xmb_music_index = -1; }
+			}
+			dialog.accept();
+			return;
+		}
+		if (action.startsWith("xmb.folder."))
+		{
+			const QString kind = action.mid(QStringLiteral("xmb.folder.").size());
+			const QHash<QString, QPair<QString, QString>> folders{
+				{QStringLiteral("games"), {QStringLiteral("gameFolder"), tr("Game Folder")}},
+				{QStringLiteral("music"), {QStringLiteral("musicFolder"), tr("Music Folder")}},
+				{QStringLiteral("videos"), {QStringLiteral("videoFolder"), tr("Video Folder")}},
+				{QStringLiteral("pictures"), {QStringLiteral("pictureFolder"), tr("Picture Folder")}}
+			};
+			const auto found = folders.constFind(kind);
+			if (found == folders.cend()) return;
+			const QString key = QStringLiteral("armsxpc/xmb/") + found->first;
+			show_file_browser(tr("Choose %1").arg(found->second), {}, false, true,
+				[this, &dialog, key, kind](const QStringList& selected)
+				{
+					if (selected.isEmpty()) return;
+					const QString path = QFileInfo(selected.front()).absoluteFilePath();
+					QSettings().setValue(key, path);
+					if (kind == QStringLiteral("games"))
+					{
+						m_xmb_refresh_pending = true;
+						QTimer::singleShot(0, this, [this, path]
+						{
+							gui_log.notice("Adding games from the XMB library folder: %s", path.toStdString());
+							Emu.AddGamesFromDir(path.toStdString());
+							m_game_list_frame->AddRefreshedSlot([this](std::set<std::string>&)
+							{
+								m_xmb_refresh_pending = false;
+								if (m_xmb_frontend_enabled) QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+							});
+							m_game_list_frame->Refresh(true);
+						});
+					}
+					dialog.accept();
+				});
+		}
+		else if (action == "osd.toggle")
 		{
 			g_cfg.video.perf_overlay.enabled.set(!g_cfg.video.perf_overlay.enabled.get());
 		}
 		else if (action == "osd.settings")
 		{
-			const gui_game_info* game = nullptr;
-			if (!Emu.IsStopped() && m_game_list_frame)
-				for (const auto& candidate : m_game_list_frame->GetGameInfo())
-					if (candidate && candidate->serial == Emu.GetTitleID()) { game = candidate.get(); break; }
-			auto* settings = new settings_dialog(m_gui_settings, m_emu_settings, 1, this, game);
-			connect(settings, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
-			connect(settings, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
-			connect(settings, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
-			connect(settings, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
-			settings->setAttribute(Qt::WA_DeleteOnClose);
-			settings->open();
+			show_settings_panel(1, nullptr);
 		}
 		else if (action.startsWith("settings."))
 		{
 			bool ok = false;
 			const int tab = action.mid(QStringLiteral("settings.").size()).toInt(&ok);
 			if (!ok) return;
-			const gui_game_info* game = nullptr;
-			if (!Emu.IsStopped() && m_game_list_frame)
-				for (const auto& candidate : m_game_list_frame->GetGameInfo())
-					if (candidate && candidate->serial == Emu.GetTitleID()) { game = candidate.get(); break; }
-			auto* settings = new settings_dialog(m_gui_settings, m_emu_settings, std::clamp(tab, 0, 8), this, game);
-			connect(settings, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
-			connect(settings, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
-			connect(settings, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
-			connect(settings, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
-			settings->setAttribute(Qt::WA_DeleteOnClose);
-			settings->open();
+			show_settings_panel(tab, nullptr);
 		}
 		else if (action == "remoteplay")
 		{
@@ -896,10 +1509,160 @@ void main_window::ShowXmbMode()
 			}
 			else ShowRemotePlayCapture();
 		}
+		else if (action == "boot.file")
+		{
+			show_file_browser(tr("Launch Game"), {QStringLiteral("iso"), QStringLiteral("chd"), QStringLiteral("bin"), QStringLiteral("self"), QStringLiteral("elf")}, false, true,
+				[this, &dialog](const QStringList& paths)
+				{
+					if (paths.isEmpty()) return;
+					const QString path = QFileInfo(paths.front()).absoluteFilePath();
+					const bool is_directory = QFileInfo(path).isDir();
+					m_gui_settings->SetValue(gui::fd_boot_game, QFileInfo(path).dir().path());
+					dialog.accept();
+					QTimer::singleShot(0, this, [this, path, is_directory]
+					{
+						gui_log.notice("Booting game from the XMB browser...");
+						Boot(path.toStdString(), "", !is_directory, true);
+					});
+				});
+		}
 		else if (action.startsWith("music.play:"))
 		{
-			auto* player = new music_player_dialog(action.mid(QStringLiteral("music.play:").size()), this);
-			player->setAttribute(Qt::WA_DeleteOnClose); player->show();
+			start_xmb_music({action.mid(QStringLiteral("music.play:").size())}, 0);
+		}
+		else if (action.startsWith("video.play:"))
+		{
+			const QString path = action.mid(QStringLiteral("video.play:").size());
+			auto* panel = new QDialog(&dialog);
+			panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+			panel->setAttribute(Qt::WA_DeleteOnClose);
+			panel->setGeometry(dialog.rect());
+			panel->setStyleSheet(QStringLiteral("QDialog { background: #050609; color: white; } QPushButton { background: rgba(255,255,255,24); color: white; border: 1px solid rgba(255,255,255,65); padding: 7px 12px; } QSlider::groove:horizontal { height: 4px; background: rgba(255,255,255,80); } QSlider::handle:horizontal { width: 12px; margin: -5px 0; border-radius: 6px; background: white; }"));
+			auto* layout = new QVBoxLayout(panel);
+			layout->setContentsMargins(30, 22, 30, 24);
+		auto* title = new QLabel(QFileInfo(path).completeBaseName(), panel);
+			title->setAlignment(Qt::AlignCenter);
+			auto* video = new QVideoWidget(panel);
+			video->setMinimumSize(480, 270);
+			video->setStyleSheet(QStringLiteral("background: black;"));
+			auto* seek = new QSlider(Qt::Horizontal, panel);
+			seek->setRange(0, 0);
+			auto* controls = new QHBoxLayout;
+			auto* play_pause = new QPushButton(tr("Pause"), panel);
+			auto* stop = new QPushButton(tr("Stop"), panel);
+			auto* close = new QPushButton(tr("Back to XMB"), panel);
+			auto* time = new QLabel(tr("00:00 / 00:00"), panel);
+			controls->addWidget(play_pause);
+			controls->addWidget(stop);
+			controls->addWidget(time);
+			controls->addStretch();
+			controls->addWidget(close);
+			layout->addWidget(title);
+			layout->addWidget(video, 1);
+			layout->addWidget(seek);
+			layout->addLayout(controls);
+			auto* media = new QMediaPlayer(panel);
+			auto* output = new QAudioOutput(media);
+			media->setAudioOutput(output);
+			media->setVideoOutput(video);
+			connect(media, &QMediaPlayer::durationChanged, panel, [seek](qint64 duration) { seek->setRange(0, static_cast<int>(std::min<qint64>(duration, std::numeric_limits<int>::max()))); });
+			connect(media, &QMediaPlayer::positionChanged, panel, [seek, time, media](qint64 position)
+			{
+				if (!seek->isSliderDown()) seek->setValue(static_cast<int>(position));
+				const auto stamp = [](qint64 ms) { return QStringLiteral("%1:%2").arg(ms / 60000, 2, 10, QLatin1Char('0')).arg((ms / 1000) % 60, 2, 10, QLatin1Char('0')); };
+				time->setText(QStringLiteral("%1 / %2").arg(stamp(position), stamp(media->duration())));
+			});
+			connect(seek, &QSlider::sliderMoved, media, &QMediaPlayer::setPosition);
+			connect(play_pause, &QPushButton::clicked, panel, [media, play_pause]
+			{
+				if (media->playbackState() == QMediaPlayer::PlayingState) { media->pause(); play_pause->setText(QObject::tr("Play")); }
+				else { media->play(); play_pause->setText(QObject::tr("Pause")); }
+			});
+			connect(media, &QMediaPlayer::playbackStateChanged, panel, [play_pause](QMediaPlayer::PlaybackState state)
+			{
+				play_pause->setText(state == QMediaPlayer::PlayingState ? QObject::tr("Pause") : QObject::tr("Play"));
+			});
+			connect(stop, &QPushButton::clicked, media, &QMediaPlayer::stop);
+			connect(close, &QPushButton::clicked, panel, &QDialog::close);
+			connect(panel, &QDialog::finished, &dialog, [&dialog, media] { media->stop(); dialog.set_settings_overlay(false); dialog.setFocus(Qt::OtherFocusReason); });
+			dialog.set_settings_overlay(true);
+			media->setSource(QUrl::fromLocalFile(path));
+			media->play();
+			panel->show();
+			panel->raise();
+			panel->setFocus(Qt::OtherFocusReason);
+		}
+		else if (action == "video.import")
+		{
+			show_file_browser(tr("Import Videos"), {QStringLiteral("avi"), QStringLiteral("mkv"), QStringLiteral("mp4"), QStringLiteral("m4v"), QStringLiteral("mov"), QStringLiteral("mpeg"), QStringLiteral("mpg"), QStringLiteral("wmv"), QStringLiteral("webm"), QStringLiteral("m2ts"), QStringLiteral("mts"), QStringLiteral("vob")}, true, false,
+				[this, &dialog](const QStringList& files)
+				{
+					const QString configured = QSettings().value(QStringLiteral("armsxpc/xmb/videoFolder")).toString();
+					const QString root = configured.isEmpty() ? QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/videos/") : QDir(configured).absolutePath() + QDir::separator();
+					QDir().mkpath(root);
+					for (const QString& source : files)
+					{
+						const QFileInfo info(source);
+						QString target = root + info.fileName();
+						for (int suffix = 2; QFile::exists(target); ++suffix)
+							target = root + info.completeBaseName() + QStringLiteral(" (%1).").arg(suffix) + info.suffix();
+						QFile::copy(source, target);
+					}
+					if (!files.isEmpty()) { dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode); }
+				});
+		}
+		else if (action == "video.playlist.create" || action.startsWith("video.playlist.add:") || action.startsWith("video.playlist.remove:") || action.startsWith("video.playlist.clear:") || action.startsWith("video.playlist.delete:"))
+		{
+			QSettings settings;
+			const QString key = QStringLiteral("armsxpc/xmb/videoPlaylists");
+			QVariantMap playlists = settings.value(key).toMap();
+			if (action == "video.playlist.create")
+			{
+				bool ok = false;
+				const QString name = QInputDialog::getText(&dialog, tr("Create Video Playlist"), tr("Playlist name"), QLineEdit::Normal, {}, &ok).trimmed();
+				if (!ok || name.isEmpty()) return;
+				if (playlists.contains(name)) { QMessageBox::information(&dialog, tr("Video Playlist"), tr("A playlist with that name already exists.")); return; }
+				playlists.insert(name, QStringList{});
+			}
+			else if (action.startsWith("video.playlist.add:"))
+			{
+				const QString path = QUrl::fromPercentEncoding(action.mid(QStringLiteral("video.playlist.add:").size()).toLatin1());
+				QStringList names = playlists.keys();
+				if (names.isEmpty())
+				{
+					bool ok = false;
+					const QString name = QInputDialog::getText(&dialog, tr("Create Video Playlist"), tr("Playlist name"), QLineEdit::Normal, {}, &ok).trimmed();
+					if (!ok || name.isEmpty()) return;
+					playlists.insert(name, QStringList{}); names.push_back(name);
+				}
+				bool ok = false;
+				const QString name = QInputDialog::getItem(&dialog, tr("Add to Video Playlist"), tr("Playlist"), names, 0, false, &ok);
+				if (!ok) return;
+				QStringList paths = playlists.value(name).toStringList();
+				if (!paths.contains(path)) paths.push_back(path);
+				playlists.insert(name, paths);
+			}
+			else
+			{
+				const bool remove_one = action.startsWith("video.playlist.remove:");
+				const bool delete_list = action.startsWith("video.playlist.delete:");
+				const QString prefix = remove_one ? QStringLiteral("video.playlist.remove:") : delete_list ? QStringLiteral("video.playlist.delete:") : QStringLiteral("video.playlist.clear:");
+				const QString data = action.mid(prefix.size());
+				const qsizetype separator = remove_one ? data.indexOf(':') : -1;
+				const QString name = QUrl::fromPercentEncoding((separator < 0 ? data : data.left(separator)).toLatin1());
+				QStringList paths = playlists.value(name).toStringList();
+				if (remove_one && separator >= 0) paths.removeAll(QUrl::fromPercentEncoding(data.mid(separator + 1).toLatin1()));
+				if (delete_list) playlists.remove(name);
+				else playlists.insert(name, remove_one ? paths : QStringList{});
+			}
+			settings.setValue(key, playlists);
+			dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode);
+		}
+		else if (action.startsWith("video.playlist.start:"))
+		{
+			const QString name = QUrl::fromPercentEncoding(action.mid(QStringLiteral("video.playlist.start:").size()).toLatin1());
+			QStringList paths = QSettings().value(QStringLiteral("armsxpc/xmb/videoPlaylists")).toMap().value(name).toStringList();
+			show_video_playlist(std::move(paths), name);
 		}
 		else if (action == "music.playlist.create" || action.startsWith("music.playlist.add:") || action.startsWith("music.playlist.remove:") || action.startsWith("music.playlist.clear:") || action.startsWith("music.playlist.delete:"))
 		{
@@ -952,67 +1715,53 @@ void main_window::ShowXmbMode()
 		{
 			const QString name = QUrl::fromPercentEncoding(action.mid(QStringLiteral("music.playlist.start:").size()).toLatin1());
 			QStringList paths = QSettings().value(QStringLiteral("armsxpc/xmb/musicPlaylists")).toMap().value(name).toStringList();
-			paths.erase(std::remove_if(paths.begin(), paths.end(), [](const QString& path) { return !QFileInfo::exists(path); }), paths.end());
-			if (paths.isEmpty()) { QMessageBox::information(&dialog, tr("Music Playlist"), tr("This playlist has no available tracks.")); return; }
-			auto* window = new QDialog(this);
-			window->setAttribute(Qt::WA_DeleteOnClose);
-			window->setWindowTitle(tr("Music Playlist: %1").arg(name));
-			window->resize(520, 180);
-			auto* layout = new QVBoxLayout(window);
-			auto* title = new QLabel(window); title->setAlignment(Qt::AlignCenter); layout->addWidget(title, 1);
-			auto* controls = new QHBoxLayout;
-			auto* previous = new QPushButton(tr("Previous"), window);
-			auto* toggle = new QPushButton(tr("Pause"), window);
-			auto* next = new QPushButton(tr("Next"), window);
-			auto* close = new QPushButton(tr("Close"), window);
-			controls->addWidget(previous); controls->addWidget(toggle); controls->addWidget(next); controls->addStretch(); controls->addWidget(close); layout->addLayout(controls);
-			auto* media = new QMediaPlayer(window);
-			auto* output = new QAudioOutput(media); output->setVolume(.8f); media->setAudioOutput(output);
-			int index = 0;
-			auto play_index = [&](int selected)
-			{
-				index = (selected + paths.size()) % paths.size();
-				title->setText(QStringLiteral("%1\n%2 / %3").arg(QFileInfo(paths[index]).completeBaseName()).arg(index + 1).arg(paths.size()));
-				media->setSource(QUrl::fromLocalFile(paths[index])); media->play(); toggle->setText(tr("Pause"));
-			};
-			connect(previous, &QPushButton::clicked, window, [&] { play_index(index - 1); });
-			connect(next, &QPushButton::clicked, window, [&] { play_index(index + 1); });
-			connect(toggle, &QPushButton::clicked, window, [&]
-			{
-				if (media->playbackState() == QMediaPlayer::PlayingState) { media->pause(); toggle->setText(tr("Play")); }
-				else { media->play(); toggle->setText(tr("Pause")); }
-			});
-			connect(media, &QMediaPlayer::mediaStatusChanged, window, [&](QMediaPlayer::MediaStatus status)
-			{
-				if (status == QMediaPlayer::EndOfMedia) play_index(index + 1);
-			});
-			connect(close, &QPushButton::clicked, window, &QDialog::close);
-			play_index(0);
-			window->show();
+			start_xmb_music(std::move(paths), 0);
 		}
 		else if (action == "music.import")
 		{
-			const QStringList files = QFileDialog::getOpenFileNames(&dialog, tr("Import Music"), QString(), tr("Audio files (*.mp3 *.ogg *.wav *.flac *.m4a *.aac *.opus);;All files (*.*)"));
-			const QString root = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/music/");
-			QDir().mkpath(root);
-			for (const QString& source : files)
+			show_file_browser(tr("Import Music"), {QStringLiteral("mp3"), QStringLiteral("ogg"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus")}, true, false,
+				[this, &dialog](const QStringList& files)
 			{
-				QFileInfo info(source);
-				QString target = root + info.fileName();
-				for (int suffix = 2; QFile::exists(target); ++suffix)
-					target = root + info.completeBaseName() + QStringLiteral(" (%1).").arg(suffix) + info.suffix();
-				QFile::copy(source, target);
-			}
-			if (!files.isEmpty()) { dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode); }
+				const QString configured = QSettings().value(QStringLiteral("armsxpc/xmb/musicFolder")).toString();
+				const QString root = configured.isEmpty() ? QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/music/") : QDir(configured).absolutePath() + QDir::separator();
+				QDir().mkpath(root);
+				for (const QString& source : files)
+				{
+					QFileInfo info(source);
+					QString target = root + info.fileName();
+					for (int suffix = 2; QFile::exists(target); ++suffix)
+						target = root + info.completeBaseName() + QStringLiteral(" (%1).").arg(suffix) + info.suffix();
+					QFile::copy(source, target);
+				}
+				if (!files.isEmpty()) { dialog.accept(); QTimer::singleShot(0, this, &main_window::ShowXmbMode); }
+			});
 		}
 		else if (action == "music")
 		{
-			auto* player = new music_player_dialog(this); player->setAttribute(Qt::WA_DeleteOnClose); player->open();
+			QStringList tracks;
+			QStringList roots{QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/music/")};
+			const QString configured = QSettings().value(QStringLiteral("armsxpc/xmb/musicFolder")).toString();
+			if (!configured.isEmpty()) roots.push_back(configured);
+			const QStringList formats{QStringLiteral("mp3"), QStringLiteral("ogg"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("m4a"), QStringLiteral("aac"), QStringLiteral("opus")};
+			QSet<QString> seen;
+			for (const QString& root : roots)
+			{
+				QDirIterator it(root, QDir::Files, QDirIterator::Subdirectories);
+				while (it.hasNext())
+				{
+					const QString path = it.next();
+					if (!formats.contains(QFileInfo(path).suffix(), Qt::CaseInsensitive)) continue;
+					const QString canonical = QFileInfo(path).canonicalFilePath();
+					const QString identity = canonical.isEmpty() ? QFileInfo(path).absoluteFilePath() : canonical;
+					if (!seen.contains(identity)) { seen.insert(identity); tracks.push_back(path); }
+				}
+			}
+			show_music_player(std::move(tracks), 0, tr("Music Player"));
 		}
 		else if (action == "screenshots")
 		{
-			auto* screenshots = new screenshot_manager_dialog(m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, this);
-			screenshots->setAttribute(Qt::WA_DeleteOnClose); screenshots->show();
+			auto* screenshots = new screenshot_manager_dialog(m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, &dialog);
+			show_xmb_panel(screenshots);
 		}
 		else if (action == "photo.playlist.create")
 		{
@@ -1090,76 +1839,139 @@ void main_window::ShowXmbMode()
 				std::sort(photos.begin(), photos.end(), [](const QString& a, const QString& b) { return QFileInfo(a).lastModified() > QFileInfo(b).lastModified(); });
 			}
 			if (photos.isEmpty()) return;
-			int index = slideshow ? 0 : photos.indexOf(QFileInfo(path).absoluteFilePath());
-			if (index < 0) index = 0;
-			QDialog viewer(this);
-			viewer.setWindowTitle(slideshow ? tr("Photo Slideshow") : QFileInfo(path).fileName());
-			viewer.resize(1200, 800);
-			auto* layout = new QVBoxLayout(&viewer);
-			auto* image = new QLabel(&viewer);
+			auto current = std::make_shared<int>(slideshow ? 0 : photos.indexOf(QFileInfo(path).absoluteFilePath()));
+			if (*current < 0) *current = 0;
+			auto photo_queue = std::make_shared<QStringList>(std::move(photos));
+			auto* viewer = new QDialog(&dialog);
+			viewer->setWindowTitle(slideshow ? tr("Photo Slideshow") : QFileInfo(path).fileName());
+			viewer->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+			viewer->setAttribute(Qt::WA_DeleteOnClose);
+			viewer->setGeometry(dialog.rect());
+			auto* layout = new QVBoxLayout(viewer);
+			layout->setContentsMargins(24, 20, 24, 24);
+			auto* image = new QLabel(viewer);
 			image->setAlignment(Qt::AlignCenter);
 			image->setMinimumSize(320, 240);
 			layout->addWidget(image, 1);
 			auto* controls = new QHBoxLayout;
-			auto* previous = new QPushButton(tr("Previous"), &viewer);
-			auto* play = new QPushButton(slideshow ? tr("Pause") : tr("Slideshow"), &viewer);
-			auto* next = new QPushButton(tr("Next"), &viewer);
-			auto* close = new QPushButton(tr("Close"), &viewer);
+			auto* previous = new QPushButton(tr("Previous"), viewer);
+			auto* play = new QPushButton(slideshow ? tr("Pause") : tr("Slideshow"), viewer);
+			auto* next = new QPushButton(tr("Next"), viewer);
+			auto* close = new QPushButton(tr("Back to XMB"), viewer);
 			controls->addWidget(previous); controls->addWidget(play); controls->addWidget(next); controls->addStretch(); controls->addWidget(close);
 			layout->addLayout(controls);
-			QTimer timer(&viewer);
-			timer.setInterval(5000);
-			auto show_photo = [&]
+			auto* timer = new QTimer(viewer);
+			timer->setInterval(5000);
+			auto show_photo = [photo_queue, current, image, viewer]
 			{
-				if (photos.isEmpty()) return;
-				QImageReader reader(photos[index]); reader.setAutoTransform(true);
+				if (photo_queue->isEmpty()) return;
+				QImageReader reader(photo_queue->at(*current)); reader.setAutoTransform(true);
 				QImage frame = reader.read();
 				if (!frame.isNull()) image->setPixmap(QPixmap::fromImage(frame.scaled(image->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
-				viewer.setWindowTitle(QStringLiteral("%1 (%2/%3)").arg(QFileInfo(photos[index]).fileName()).arg(index + 1).arg(photos.size()));
+				viewer->setWindowTitle(QStringLiteral("%1 (%2/%3)").arg(QFileInfo(photo_queue->at(*current)).fileName()).arg(*current + 1).arg(photo_queue->size()));
 			};
-			auto step = [&](int direction) { index = (index + direction + photos.size()) % photos.size(); show_photo(); };
-			connect(previous, &QPushButton::clicked, &viewer, [&] { step(-1); });
-			connect(next, &QPushButton::clicked, &viewer, [&] { step(1); });
-			connect(close, &QPushButton::clicked, &viewer, &QDialog::accept);
-			connect(play, &QPushButton::clicked, &viewer, [&]
+			auto step = [photo_queue, current, show_photo](int direction) { *current = (*current + direction + photo_queue->size()) % photo_queue->size(); show_photo(); };
+			connect(previous, &QPushButton::clicked, viewer, [step] { step(-1); });
+			connect(next, &QPushButton::clicked, viewer, [step] { step(1); });
+			connect(close, &QPushButton::clicked, viewer, &QDialog::accept);
+			connect(play, &QPushButton::clicked, viewer, [timer, play]
 			{
-				if (timer.isActive()) { timer.stop(); play->setText(tr("Slideshow")); }
-				else { timer.start(); play->setText(tr("Pause")); }
+				if (timer->isActive()) { timer->stop(); play->setText(QObject::tr("Slideshow")); }
+				else { timer->start(); play->setText(QObject::tr("Pause")); }
 			});
-			connect(&timer, &QTimer::timeout, &viewer, [&] { step(1); });
-			new QShortcut(QKeySequence(Qt::Key_Left), &viewer, [&] { step(-1); });
-			new QShortcut(QKeySequence(Qt::Key_Right), &viewer, [&] { step(1); });
-			new QShortcut(QKeySequence(Qt::Key_Escape), &viewer, [&viewer] { viewer.accept(); });
+			connect(timer, &QTimer::timeout, viewer, [step] { step(1); });
+			new QShortcut(QKeySequence(Qt::Key_Left), viewer, [step] { step(-1); });
+			new QShortcut(QKeySequence(Qt::Key_Right), viewer, [step] { step(1); });
+			new QShortcut(QKeySequence(Qt::Key_Escape), viewer, [viewer] { viewer->accept(); });
 			layout->activate();
 			show_photo();
-			if (slideshow && photos.size() > 1) timer.start();
-			viewer.exec();
+			if (slideshow && photo_queue->size() > 1) timer->start();
+			show_xmb_panel(viewer);
 		}
 		else if (action == "packages") InstallPackages(this);
 		else if (action == "firmware") InstallPup(this);
-		else if (action == "users") { user_manager_dialog users(m_gui_settings, m_persistent_settings, this); users.exec(); m_game_list_frame->Refresh(true); }
-		else if (action == "padsettings") { pad_settings_dialog pads(m_gui_settings, this); pads.exec(); }
+		else if (action == "users")
+		{
+			auto* users = new user_manager_dialog(m_gui_settings, m_persistent_settings, &dialog);
+			connect(users, &QDialog::finished, &dialog, [this] { if (m_game_list_frame) m_game_list_frame->Refresh(true); });
+			show_xmb_panel(users);
+		}
+		else if (action == "padsettings")
+		{
+			auto* panel = new pad_settings_dialog(m_gui_settings, &dialog);
+			panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+			const int panel_left = qRound(dialog.width() * .42);
+			panel->setGeometry(panel_left, 0, dialog.width() - panel_left, dialog.height()); panel->setAttribute(Qt::WA_DeleteOnClose);
+			panel->setStyleSheet(QStringLiteral("QDialog { background: rgba(12,14,20,242); color: white; } QWidget { color: #f2f2f2; }"));
+			dialog.set_settings_overlay(true);
+			connect(panel, &QDialog::finished, &dialog, [&dialog] { dialog.set_settings_overlay(false); dialog.setFocus(Qt::OtherFocusReason); });
+			panel->show(); panel->raise(); panel->setFocus(Qt::OtherFocusReason);
+		}
 		else if (action == "boot.file") BootGame();
 		else if (action == "boot.vsh") BootVSH();
-		else if (action == "trophies") { auto* manager = new trophy_manager_dialog(m_gui_settings); connect(this, &main_window::RequestDialogRepaint, manager, &trophy_manager_dialog::HandleRepaintUiRequest); manager->show(); }
-		else if (action == "savedata") { auto* manager = new save_manager_dialog(m_gui_settings, m_persistent_settings); connect(this, &main_window::RequestDialogRepaint, manager, &save_manager_dialog::HandleRepaintUiRequest); manager->show(); }
+		else if (action == "trophies")
+		{
+			auto* manager = new trophy_manager_dialog(m_gui_settings);
+			connect(this, &main_window::RequestDialogRepaint, manager, &trophy_manager_dialog::HandleRepaintUiRequest);
+			show_xmb_widget(manager, tr("Trophy Collection"));
+		}
+		else if (action == "savedata")
+		{
+			auto* manager = new save_manager_dialog(m_gui_settings, m_persistent_settings, {}, &dialog);
+			connect(this, &main_window::RequestDialogRepaint, manager, &save_manager_dialog::HandleRepaintUiRequest);
+			show_xmb_panel(manager);
+		}
 		else if (action == "savestates")
 		{
 			auto* manager = new savestate_manager_dialog(m_gui_settings, m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{});
 			connect(this, &main_window::RequestDialogRepaint, manager, &savestate_manager_dialog::HandleRepaintUiRequest);
-			connect(manager, &savestate_manager_dialog::RequestBoot, this, [this](const std::string& path) { Boot(path, "", true); });
-			manager->show();
+			connect(manager, &savestate_manager_dialog::RequestBoot, this, [this, &dialog](const std::string& path)
+			{
+				dialog.accept();
+				QTimer::singleShot(0, this, [this, path] { Boot(path, "", true); });
+			});
+			show_xmb_widget(manager, tr("Save States"));
 		}
-		else if (action == "patches") { patch_manager_dialog manager(m_gui_settings, m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, "", "", this); manager.exec(); }
-		else if (action == "rpcn.friends") { rpcn_friends_dialog friends(&dialog); friends.exec(); }
-		else if (action == "rpcn") { rpcn_settings_dialog settings(&dialog); settings.exec(); }
+		else if (action == "patches")
+		{
+			auto* manager = new patch_manager_dialog(m_gui_settings, m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{}, "", "", &dialog);
+			show_xmb_panel(manager);
+		}
+		else if (action == "rpcn.friends")
+		{
+			auto* friends = new rpcn_friends_dialog(&dialog);
+			show_xmb_panel(friends);
+		}
+		else if (action == "rpcn")
+		{
+			auto* panel = new rpcn_settings_dialog(&dialog);
+			panel->setWindowFlags(Qt::Widget | Qt::FramelessWindowHint);
+			const int panel_left = qRound(dialog.width() * .42);
+			panel->setGeometry(panel_left, 0, dialog.width() - panel_left, dialog.height()); panel->setAttribute(Qt::WA_DeleteOnClose);
+			panel->setStyleSheet(QStringLiteral("QDialog { background: rgba(12,14,20,242); color: white; } QWidget { color: #f2f2f2; }"));
+			dialog.set_settings_overlay(true);
+			connect(panel, &QDialog::finished, &dialog, [&dialog] { dialog.set_settings_overlay(false); dialog.setFocus(Qt::OtherFocusReason); });
+			panel->show(); panel->raise(); panel->setFocus(Qt::OtherFocusReason);
+		}
 		else if (action == "system.poweroff")
 		{
-			if (QMessageBox::question(this, tr("Turn Off System"), tr("Are you sure you want to exit ARMSXPC?"), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) close();
+			if (QMessageBox::question(&dialog, tr("Turn Off System"), tr("Are you sure you want to exit ARMSXPC?"), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes)
+			{
+				m_xmb_frontend_enabled = false;
+				m_xmb_exit_confirmed = true;
+				m_xmb_exit_requested = true;
+				dialog.accept();
+			}
 		}
 		else if (action == "system.exit")
 		{
-			if (QMessageBox::question(this, tr("Exit ARMSXPC"), tr("Exit ARMSXPC?"), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) close();
+			if (QMessageBox::question(&dialog, tr("Exit ARMSXPC"), tr("Exit ARMSXPC?"), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes)
+			{
+				m_xmb_frontend_enabled = false;
+				m_xmb_exit_confirmed = true;
+				m_xmb_exit_requested = true;
+				dialog.accept();
+			}
 		}
 		else if (action == "game.resume") { if (Emu.GetStatus() == system_state::paused) Emu.Resume(); }
 		else if (action == "game.restart") { if (!Emu.GetBoot().empty()) Emu.Restart(); }
@@ -1174,14 +1986,16 @@ void main_window::ShowXmbMode()
 		}
 		else if (action == "xmb.background")
 		{
-			const QString path = QFileDialog::getOpenFileName(&dialog, tr("Choose XMB Background"), QString(), tr("Images (*.png *.jpg *.jpeg *.bmp *.webp);;All files (*.*)"));
-			if (!path.isEmpty()) dialog.set_custom_background(path);
+			show_file_browser(tr("Choose XMB Background"), {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("bmp"), QStringLiteral("webp")}, false, false,
+				[&dialog](const QStringList& paths) { if (!paths.isEmpty()) dialog.set_custom_background(paths.front()); });
 		}
 		else if (action == "xmb.theme.import")
 		{
-			const QString source = QFileDialog::getOpenFileName(&dialog, tr("Import PS3 Theme"), QString(), tr("PS3 themes (*.p3t);;All files (*.*)"));
-			if (!source.isEmpty())
+			show_file_browser(tr("Import PS3 Theme"), {QStringLiteral("p3t")}, false, false,
+				[&dialog](const QStringList& sources)
 			{
+				if (sources.isEmpty()) return;
+				const QString source = sources.front();
 				const QString themes_dir = QString::fromStdString(fs::get_config_dir()) + QStringLiteral("armsxpc/themes/");
 				QDir().mkpath(themes_dir);
 				const QFileInfo info(source);
@@ -1195,7 +2009,7 @@ void main_window::ShowXmbMode()
 				}
 				const QString error = dialog.import_p3t_theme(path);
 				if (!error.isEmpty()) QMessageBox::warning(&dialog, tr("PS3 Theme"), error);
-			}
+			});
 		}
 		else if (action.startsWith("xmb.theme.select:"))
 		{
@@ -1271,7 +2085,8 @@ void main_window::ShowXmbMode()
 			const auto games = m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{};
 			QVector<game_info> bootable; for (const auto& game : games) if (game && game->bootable) bootable.push_back(game);
 			if (!ok || index < 0 || index >= bootable.size()) return;
-			Boot(bootable[index]->path, bootable[index]->serial);
+			requested_boot = bootable[index];
+			dialog.accept();
 		}
 		else if (action.startsWith("game.settings.") || action.startsWith("game.cache."))
 		{
@@ -1283,12 +2098,7 @@ void main_window::ShowXmbMode()
 			if (!ok || index < 0 || index >= bootable.size()) return;
 			if (open_settings)
 			{
-				auto* dlg = new settings_dialog(m_gui_settings, m_emu_settings, 0, this, bootable[index].get());
-				connect(dlg, &settings_dialog::GuiStylesheetRequest, this, &main_window::RequestGlobalStylesheetChange);
-				connect(dlg, &settings_dialog::GuiRepaintRequest, this, &main_window::RepaintGui);
-				connect(dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::NotifyEmuSettingsChange);
-				connect(dlg, &settings_dialog::EmuSettingsApplied, this, &main_window::update_gui_pad_thread);
-				dlg->setAttribute(Qt::WA_DeleteOnClose); dlg->open();
+				show_settings_panel(0, bootable[index].get());
 			}
 			else if (QMessageBox::question(this, tr("Clear Game Cache"), tr("Clear this game's PPU and SPU caches?")) == QMessageBox::Yes)
 			{
@@ -1296,8 +2106,38 @@ void main_window::ShowXmbMode()
 				m_game_list_frame->actions()->BatchRemoveSPUCaches({bootable[index]}, false);
 			}
 		}
+		else if (action.startsWith("game.config."))
+		{
+			const QStringList fields = action.split(QLatin1Char('.'));
+			if (fields.size() != 4) return;
+			bool game_ok = false, tab_ok = false;
+			const int index = fields[2].toInt(&game_ok);
+			const int tab = fields[3].toInt(&tab_ok);
+			const auto games = m_game_list_frame ? m_game_list_frame->GetGameInfo() : std::vector<game_info>{};
+			QVector<game_info> bootable;
+			for (const auto& game : games) if (game && game->bootable) bootable.push_back(game);
+			if (!game_ok || !tab_ok || index < 0 || index >= bootable.size() || tab < 0 || tab > 7) return;
+			show_settings_panel(tab, bootable[index].get());
+		}
 	});
+	if (!in_game && QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusic"), false).toBool() && m_xmb_music_queue.isEmpty())
+	{
+		QStringList tracks = xmb_library_tracks();
+		if (start_xmb_music(tracks, 0) && m_xmb_music_output) m_xmb_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/libraryMusicVolume"), 15).toInt() / 100.f);
+	}
+	if (in_game && QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusic"), false).toBool())
+	{
+		const QString track = QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusicTrack")).toString();
+		if (QFileInfo(track).isFile())
+		{
+			if (!m_xmb_pause_music_player) { m_xmb_pause_music_player = new QMediaPlayer(this); m_xmb_pause_music_player->setLoops(QMediaPlayer::Infinite); m_xmb_pause_music_output = new QAudioOutput(m_xmb_pause_music_player); m_xmb_pause_music_player->setAudioOutput(m_xmb_pause_music_output); }
+			m_xmb_pause_music_output->setVolume(QSettings().value(QStringLiteral("armsxpc/xmb/pauseMusicVolume"), 15).toInt() / 100.f);
+			m_xmb_pause_music_player->setSource(QUrl::fromLocalFile(track)); m_xmb_pause_music_player->play();
+		}
+	}
 	dialog.exec();
+	if (in_game && m_xmb_pause_music_player) m_xmb_pause_music_player->stop();
+	QApplication::setQuitOnLastWindowClosed(restore_quit_on_last_window_closed);
 	// Let this function return and destroy the XMB dialog and its OpenGL widget before boot
 	// initialization starts pumping GUI events. Starting Boot() from a bootRequested slot keeps
 	// exec() on the stack and lets Qt repaint a half-closed XMB while RSX is being initialized.
@@ -1306,12 +2146,21 @@ void main_window::ShowXmbMode()
 	else if (resume_after_xmb && Emu.GetStatus() == system_state::paused)
 		Emu.Resume();
 	m_xmb_mode_open = false;
+	if (m_xmb_exit_requested)
+	{
+		QTimer::singleShot(0, this, &main_window::close);
+		return;
+	}
+	if (m_xmb_frontend_enabled && !in_game && !requested_boot && !m_xmb_refresh_pending)
+		QTimer::singleShot(0, this, &main_window::ShowXmbMode);
 }
 
 void main_window::ShowRemotePlayCapture()
 {
 	remote_play_capture_dialog dialog(this);
 	dialog.exec();
+	if (m_xmb_frontend_enabled && !Emu.IsStopped())
+		QTimer::singleShot(0, this, &main_window::ShowXmbMode);
 }
 
 void main_window::BootRsxCapture(std::string path)
@@ -2679,6 +3528,8 @@ void main_window::OnEmuStop()
 	update_gui_pad_thread();
 
 	m_system_state = system_state::stopped;
+	if (m_xmb_frontend_enabled)
+		QTimer::singleShot(0, this, &main_window::ShowXmbMode);
 }
 
 void main_window::OnEmuReady()
@@ -4701,7 +5552,7 @@ void main_window::mouseDoubleClickEvent(QMouseEvent* event)
 */
 void main_window::closeEvent(QCloseEvent* closeEvent)
 {
-	if (!m_gui_settings->GetBootConfirmation(this, gui::ib_confirm_exit))
+	if (!m_xmb_exit_confirmed && !m_gui_settings->GetBootConfirmation(this, gui::ib_confirm_exit))
 	{
 		Q_EMIT NotifyWindowCloseEvent(false);
 		closeEvent->ignore();

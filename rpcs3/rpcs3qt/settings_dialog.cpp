@@ -89,7 +89,7 @@ static void remove_item(QComboBox* box, int data_value, int def_value)
 
 extern const std::map<std::string_view, int> g_prx_list;
 
-settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std::shared_ptr<emu_settings> emu_settings, int tab_index, QWidget* parent, const GameInfo* game, bool create_cfg_from_global_cfg, const std::string& db_config)
+settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std::shared_ptr<emu_settings> emu_settings, int tab_index, QWidget* parent, const GameInfo* game, bool create_cfg_from_global_cfg, const std::string& db_config, bool show_debug_tab)
 	: QDialog(parent)
 	, m_tab_index(tab_index)
 	, ui(new Ui::settings_dialog)
@@ -101,7 +101,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	ui->tab_widget_settings->setUsesScrollButtons(false);
 	ui->tab_widget_settings->tabBar()->setObjectName("tab_bar_settings");
 
-	if (!m_gui_settings->GetValue(gui::m_showDebugTab).toBool())
+	if (!m_gui_settings->GetValue(gui::m_showDebugTab).toBool() && !show_debug_tab)
 	{
 		ui->tab_widget_settings->removeTab(9);
 		ui->audioDump->setVisible(false);
@@ -2450,6 +2450,14 @@ void settings_dialog::open()
 			}
 		}
 	});
+}
+
+void settings_dialog::set_xmb_mode()
+{
+	// The XMB Settings tree selects one RPCS3 page at a time. Hide the desktop tab strip so the
+	// setting page is presented as content in the XMB side panel rather than another settings window.
+	ui->tab_widget_settings->tabBar()->hide();
+	setWindowTitle(tr("Settings"));
 }
 
 void settings_dialog::SubscribeTooltip(QObject* object, const QString& tooltip)

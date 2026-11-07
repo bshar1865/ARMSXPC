@@ -118,6 +118,31 @@ extern "C" bool _armsx3_xmbDecodeAudio(std::string_view in_path, std::string_vie
   return ok;
 }
 
+// Extract an embedded audio cover (for example, an ID3 APIC frame) to an image file.
+extern "C" bool _armsx3_xmbExtractCoverArt(std::string_view in_path, std::string_view out_path) {
+  const std::string in(in_path);
+  const std::string out(out_path);
+  AVFormatContext* fmt = nullptr;
+  if (avformat_open_input(&fmt, in.c_str(), nullptr, nullptr) < 0) return false;
+  bool ok = false;
+  if (avformat_find_stream_info(fmt, nullptr) >= 0) {
+    for (unsigned int i = 0; i < fmt->nb_streams; ++i) {
+      AVStream* stream = fmt->streams[i];
+      const AVPacket& picture = stream->attached_pic;
+      if (!(stream->disposition & AV_DISPOSITION_ATTACHED_PIC) || !picture.data || picture.size <= 0 ||
+          picture.size > (16 * 1024 * 1024)) continue;
+      FILE* file = std::fopen(out.c_str(), "wb");
+      if (!file) break;
+      ok = std::fwrite(picture.data, 1, static_cast<std::size_t>(picture.size), file) == static_cast<std::size_t>(picture.size);
+      ok = std::fclose(file) == 0 && ok;
+      if (!ok) std::remove(out.c_str());
+      break;
+    }
+  }
+  avformat_close_input(&fmt);
+  return ok;
+}
+
 // The audio track of an ICON1.PAM as a 16-bit stereo WAV at out_path: ATRAC3plus in the PAMF's
 // private stream 1, which the console plays with the animated icon. Some games have no SND0 and this
 // is their music (THE iDOLM@STER 2). FFmpeg's program stream demuxer does not know Sony's sub-stream,

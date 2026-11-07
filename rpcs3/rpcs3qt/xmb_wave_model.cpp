@@ -61,6 +61,7 @@ xmb_wave_model::xmb_wave_model(xmb_firmware& fw)
 	}
 	m_previous = m_position;
 	m_counter = static_cast<quint32>(std::chrono::steady_clock::now().time_since_epoch().count()) & 0xffffff;
+	m_lattice_time = m_clock * 10.f;
 	float ax = m_line.axis[0], ay = m_line.axis[1], az = m_line.axis[2];
 	const float n = std::sqrt(ax * ax + ay * ay + az * az); ax /= n; ay /= n; az /= n;
 	const float a = m_line.rotation * pi / 180.f, c = std::cos(a), s = std::sin(a), ic = 1.f - c;
@@ -107,10 +108,10 @@ void xmb_wave_model::step()
 	}
 }
 
-void xmb_wave_model::fill_lattice(float t)
+void xmb_wave_model::fill_lattice(float t, float push)
 {
 	const float c = (std::sin(.1f * t) + .2f) / 1.2f;
-	const float amp = (std::sin(2.f * t) + 3.f) * std::exp(-1e-4f * t), bob = std::sin(.25f * t);
+	const float amp = (std::sin(2.f * t) + 3.f) * std::exp(-1e-4f * t) * (1.f + push * .6f), bob = std::sin(.25f * t);
 	m_lattice.resize(lx * ly * lz * 2);
 	for (int k = 0; k < lz; ++k) for (int j = 0; j < ly; ++j) for (int i = 0; i < lx; ++i)
 	{
@@ -127,14 +128,20 @@ void xmb_wave_model::update(float dt_seconds, float aspect)
 	m_accumulator += std::clamp(dt_seconds, 0.f, .25f) * 60.f;
 	int steps = 0; while (m_accumulator > 1.f && steps < 8) { step(); m_accumulator -= 1.f; ++steps; }
 	if (m_accumulator > 1.f) m_accumulator = 1.f;
-	fill_lattice(m_clock * 10.f);
+	// Match ARMSX3's music-driven firmware wave: ease its billow over 1/3 second, advance
+	// the lattice continuously at any display refresh rate, and keep its framing upright.
+	const float dt = std::clamp(dt_seconds, 0.f, .25f);
+	m_billow += (m_drive - m_billow) * std::min(1.f, dt * 3.f);
+	m_lattice_time += dt * 60.f * m_line.timestep * 1e-3f * (1.f + m_billow * 1.5f);
+	if (m_lattice_time > 100.f) m_lattice_time = 0.f;
+	fill_lattice(m_lattice_time, m_billow);
 	std::array<float, 4> bx{}, by{}, bz{};
 	auto weights = [](float t, std::array<float, 4>& o)
 	{
 		const float t2 = t * t, t3 = t2 * t, m = 1.f - t;
 		o = {m * m * m / 6.f, (3.f * t3 - 6.f * t2 + 4.f) / 6.f, (-3.f * t3 + 3.f * t2 + 3.f * t + 1.f) / 6.f, t3 / 6.f};
 	};
-	const float sx = 2.0057f / std::max(.1f, aspect), sy = 2.0057f;
+	const float sx = 2.0057f / std::max(aspect, 16.f / 9.f), sy = sx * aspect;
 	for (int i = 0; i < count; ++i)
 	{
 		const float px = m_previous[i * 3] + (m_position[i * 3] - m_previous[i * 3]) * m_accumulator;

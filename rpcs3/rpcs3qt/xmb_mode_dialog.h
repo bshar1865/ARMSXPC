@@ -18,6 +18,7 @@ class xmb_wave_model;
 class xmb_wave_widget;
 
 class QTimer;
+class QAudioBufferOutput;
 class QAudioOutput;
 class QMediaPlayer;
 class QSoundEffect;
@@ -41,6 +42,9 @@ public:
 	void toggle_game_region();
 	void toggle_game_backgrounds();
 	void toggle_animated_game_icons();
+	void set_settings_overlay(bool open);
+	void set_music_visualizer_overlay(bool open);
+	void set_wave_drive(float drive);
 
 Q_SIGNALS:
 	void bootRequested(const game_info& game);
@@ -120,6 +124,7 @@ private:
 	QTimer* m_game_backdrop_delay = nullptr;
 	QFutureWatcher<QImage>* m_game_backdrop_watcher = nullptr;
 	QFutureWatcher<QHash<int, QImage>>* m_game_icon_watcher = nullptr;
+	QFutureWatcher<QHash<QString, QImage>>* m_music_cover_watcher = nullptr;
 	QFutureWatcher<QPair<QVector<QImage>, QVector<qint64>>>* m_game_pam_watcher = nullptr;
 	QTimer* m_game_pam_timer = nullptr;
 	QVector<QImage> m_game_pam_frames;
@@ -132,6 +137,7 @@ private:
 	QTimer* m_game_audio_delay = nullptr;
 	QFutureWatcher<QString>* m_game_audio_watcher = nullptr;
 	QMediaPlayer* m_game_audio_player = nullptr;
+	QAudioBufferOutput* m_game_audio_buffer = nullptr;
 	QAudioOutput* m_game_audio_output = nullptr;
 	int m_game_audio_target = -1;
 	int m_game_audio_loading = -1;

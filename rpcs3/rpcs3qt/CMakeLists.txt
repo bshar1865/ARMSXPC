@@ -138,6 +138,7 @@ add_library(rpcs3_ui STATIC
     video_label.cpp
     welcome_dialog.cpp
     xmb_mode_dialog.cpp
+    xmb_file_browser_dialog.cpp
     xmb_p3t.cpp
     xmb_p3t_animation.cpp
     xmb_firmware.cpp

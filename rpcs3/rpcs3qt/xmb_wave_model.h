@@ -3,6 +3,7 @@
 #include <QVector>
 #include <QVector4D>
 
+#include <algorithm>
 #include <array>
 
 class xmb_firmware;
@@ -14,6 +15,8 @@ class xmb_wave_model final
 public:
 	explicit xmb_wave_model(xmb_firmware& firmware);
 	void update(float dt_seconds, float aspect);
+	// Drive supplied by the active XMB visualizer (0 at rest, roughly 1 at its loudest).
+	void set_drive(float value) { m_drive = std::clamp(value, 0.f, 1.f); }
 	const QVector<QVector4D>& points() const { return m_points; }
 
 private:
@@ -36,9 +39,9 @@ private:
 	QVector<float> m_position, m_velocity, m_previous, m_lattice;
 	QVector<QVector4D> m_points = QVector<QVector4D>(count);
 	std::array<float, 9> m_rotation{};
-	float m_clock = 0.f, m_smooth = 0.f, m_accumulator = 0.f;
+	float m_clock = 0.f, m_lattice_time = 0.f, m_billow = 0.f, m_drive = 0.f, m_smooth = 0.f, m_accumulator = 0.f;
 	quint32 m_counter = 0x5eed;
 	void step();
 	void spring(int a, int b, float rest, float strength);
-	void fill_lattice(float time);
+	void fill_lattice(float time, float push);
 };
